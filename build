@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+mkdir -p bin
+go build -o bin/subclerkd ./subclerkd/
+go build -o bin/subclerk-tui ./cmd/subclerk-tui/
+go build -o bin/subclerkc ./cmd/subclerkc/
+go build -o bin/subclerk-rofi ./cmd/subclerk-rofi/
+go build -o bin/subclerk-musiclist ./cmd/subclerk-musiclist/

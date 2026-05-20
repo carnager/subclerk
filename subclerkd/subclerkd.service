@@ -1,0 +1,12 @@
+[Unit]
+Description=Subclerk daemon (Navidrome/mpv music manager)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/subclerkd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
