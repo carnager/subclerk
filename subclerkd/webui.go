@@ -130,6 +130,24 @@ body{display:flex;flex-direction:column;overflow:hidden}
 .rate-cur{font-size:.75rem;color:var(--fg2);margin-top:10px}
 #rateHints{font-size:.7rem;color:var(--fg3);margin-top:8px}
 
+/* DEVICE PICKER */
+#devWrap{position:relative;display:inline-block}
+#devBtn{cursor:pointer;padding:4px 10px;border-radius:6px;background:var(--bg3);border:1px solid var(--border);color:var(--fg2);font-size:.8rem;display:flex;align-items:center;gap:4px}
+#devBtn:hover{border-color:var(--accent)}
+#devBtn .dev-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent)}
+#devDrop{display:none;position:absolute;top:100%;right:0;margin-top:4px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,0.2);z-index:50;overflow:hidden}
+#devDrop.open{display:block}
+#devDrop .dev-hdr{padding:8px 12px;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--fg3);border-bottom:1px solid var(--border)}
+.dev-row{padding:8px 12px;font-size:.85rem;cursor:pointer;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border)}
+.dev-row:hover{background:var(--hover-bg)}
+.dev-row.active{background:var(--playing-bg)}
+.dev-row .dev-status{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dev-row .dev-status.online{background:#22c55e}
+.dev-row .dev-status.offline{background:var(--fg3)}
+.dev-row .dev-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dev-row .dev-meta{font-size:.7rem;color:var(--fg3)}
+.dev-row .dev-active{color:var(--accent);font-size:.75rem;font-weight:600}
+
 /* SCROLLBARS */
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:var(--bg)}
@@ -144,6 +162,32 @@ body{display:flex;flex-direction:column;overflow:hidden}
 <div id="header">
   <h1>Subclerk</h1>
   <div id="searchBtn">Search... <span style="float:right;opacity:.5">Ctrl+K</span></div>
+  <div id="devWrap">
+    <button id="devBtn"><span class="dev-dot"></span> <span id="devLabel">Local</span></button>
+    <div id="devDrop">
+      <div class="dev-hdr">Devices</div>
+      <div id="devList"></div>
+      <div class="dev-hdr">Audio Quality (this browser)</div>
+      <div style="padding:8px 12px;display:flex;gap:8px;align-items:center;font-size:.8rem">
+        <select id="devFmt" style="flex:1;padding:3px 6px;border-radius:4px;border:1px solid var(--border);background:var(--bg3);color:var(--fg);font-size:.8rem">
+          <option value="">Original</option>
+          <option value="opus">Opus</option>
+          <option value="mp3">MP3</option>
+          <option value="aac">AAC</option>
+          <option value="flac">FLAC</option>
+        </select>
+        <select id="devBr" style="width:80px;padding:3px 6px;border-radius:4px;border:1px solid var(--border);background:var(--bg3);color:var(--fg);font-size:.8rem">
+          <option value="0">Max</option>
+          <option value="64">64k</option>
+          <option value="96">96k</option>
+          <option value="128">128k</option>
+          <option value="192">192k</option>
+          <option value="256">256k</option>
+          <option value="320">320k</option>
+        </select>
+      </div>
+    </div>
+  </div>
   <button class="hdr-btn" id="scrobbleBtn" title="Toggle Last.fm scrobbling">&#9835;</button>
   <button class="hdr-btn" id="btnRandom" title="Random album">&#127922;</button>
   <button class="hdr-btn" id="btnRefresh" title="Refresh cache">&#8635;</button>
@@ -194,6 +238,8 @@ body{display:flex;flex-direction:column;overflow:hidden}
     <div id="rateHints">[1-0] rate [Delete] remove [Esc] close</div>
   </div>
 </div>
+
+<audio id="audioEl" preload="none"></audio>
 
 <div id="searchOvl">
   <div id="searchBox">
@@ -757,6 +803,66 @@ $('rateOvl').addEventListener('click', function(e) {
 $('btnRateTrack').addEventListener('click', function() { openRating('track'); });
 $('btnRateAlbum').addEventListener('click', function() { openRating('album'); });
 
+// ========== DEVICES ==========
+var curDevices = [];
+var curActiveDevId = '';
+
+function refreshDevices() {
+  Promise.all([api('GET','devices'), api('GET','devices/active')]).then(function(res) {
+    curDevices = Array.isArray(res[0]) ? res[0] : [];
+    curActiveDevId = (res[1] && res[1].device_id) || '';
+    var activeName = 'Local';
+    for (var i=0; i<curDevices.length; i++) {
+      if (curDevices[i].id === curActiveDevId) {
+        activeName = curDevices[i].name;
+        break;
+      }
+    }
+    $('devLabel').textContent = activeName;
+    renderDevList();
+  }).catch(function(){});
+}
+
+function renderDevList() {
+  var html = '';
+  for (var i=0; i<curDevices.length; i++) {
+    var d = curDevices[i];
+    var cls = 'dev-row' + (d.id === curActiveDevId ? ' active' : '');
+    var stCls = 'dev-status ' + (d.online ? 'online' : 'offline');
+    var meta = '';
+    if (d.format) { meta = d.format; if (d.max_bitrate) meta += ' '+d.max_bitrate+'k'; }
+    html += '<div class="'+cls+'" data-dev-id="'+esc(d.id)+'">' +
+      '<span class="'+stCls+'"></span>' +
+      '<span class="dev-name">'+esc(d.name)+(d.is_local?' (local)':'')+'</span>' +
+      (meta ? '<span class="dev-meta">'+esc(meta)+'</span>' : '') +
+      (d.id===curActiveDevId ? '<span class="dev-active">&#9654;</span>' : '') +
+      '</div>';
+  }
+  $('devList').innerHTML = html || '<div style="padding:12px;text-align:center;color:var(--fg3)">No devices</div>';
+}
+
+$('devBtn').addEventListener('click', function(e) {
+  e.stopPropagation();
+  var drop = $('devDrop');
+  if (drop.classList.contains('open')) { drop.classList.remove('open'); return; }
+  refreshDevices();
+  drop.classList.add('open');
+});
+
+document.addEventListener('click', function(e) {
+  if (!$('devWrap').contains(e.target)) $('devDrop').classList.remove('open');
+});
+
+$('devList').addEventListener('click', function(e) {
+  var row = e.target.closest('[data-dev-id]');
+  if (!row) return;
+  var id = row.getAttribute('data-dev-id');
+  api('POST','devices/active',{device_id:id}).then(function() {
+    refreshDevices();
+    $('devDrop').classList.remove('open');
+  });
+});
+
 // ========== HEADER BUTTONS ==========
 $('btnRandom').addEventListener('click', function() {
   api('POST','playback/random/album').then(function(){setTimeout(refresh,300);});
@@ -830,11 +936,198 @@ document.addEventListener('keydown', function(e) {
   else if (e.key === 'R') { openRating('album'); }
 });
 
+// ========== BROWSER DEVICE (local playback) ==========
+var browserDevId = '';
+var browserPlaylist = []; // array of stream URLs
+var browserPlaylistPos = -1;
+var audioEl = $('audioEl');
+var isLocalDevice = false; // true when this browser is the active playback device
+var evtSource = null;
+
+function browserDevName() {
+  var n = 'web-' + (navigator.userAgent.match(/Android|iPhone|iPad/) ? 'mobile' : 'browser');
+  // Add random suffix to avoid collisions
+  var stored = null;
+  try { stored = localStorage.browserDevName; } catch(x) {}
+  if (stored) return stored;
+  n += '-' + Math.random().toString(36).slice(2,6);
+  try { localStorage.browserDevName = n; } catch(x) {}
+  return n;
+}
+
+function getBrowserAudioFormat() {
+  try { return localStorage.browserAudioFmt || ''; } catch(x) { return ''; }
+}
+function getBrowserAudioBitrate() {
+  try { return parseInt(localStorage.browserAudioBr,10) || 0; } catch(x) { return 0; }
+}
+
+function registerBrowserDevice() {
+  var name = browserDevName();
+  var fmt = getBrowserAudioFormat();
+  var br = getBrowserAudioBitrate();
+  // Restore UI selects
+  try { $('devFmt').value = fmt; $('devBr').value = String(br); } catch(x) {}
+  api('POST','devices/register',{name:name, type:'browser', format:fmt, max_bitrate:br}).then(function(r) {
+    browserDevId = r.id || name;
+    connectSSE();
+    // Heartbeat every 10s
+    setInterval(function() {
+      var state = {id: browserDevId, pause: audioEl.paused, time_pos: audioEl.currentTime||0, duration: audioEl.duration||0, playlist_pos: browserPlaylistPos};
+      api('POST','devices/status', state);
+      api('POST','devices/heartbeat',{id: browserDevId});
+    }, 10000);
+  });
+}
+
+$('devFmt').addEventListener('change', function() {
+  try { localStorage.browserAudioFmt = this.value; } catch(x) {}
+  // Re-register with new format
+  api('POST','devices/register',{name:browserDevName(), type:'browser', format:this.value, max_bitrate:getBrowserAudioBitrate()});
+});
+$('devBr').addEventListener('change', function() {
+  try { localStorage.browserAudioBr = this.value; } catch(x) {}
+  api('POST','devices/register',{name:browserDevName(), type:'browser', format:getBrowserAudioFormat(), max_bitrate:parseInt(this.value,10)||0});
+});
+
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(B+'/devices/stream?id='+encodeURIComponent(browserDevId));
+  evtSource.onmessage = function(e) {
+    var cmd;
+    try { cmd = JSON.parse(e.data); } catch(x) { return; }
+    handleBrowserCmd(cmd);
+  };
+  evtSource.onerror = function() {
+    // Reconnect handled automatically by EventSource
+  };
+}
+
+function handleBrowserCmd(cmd) {
+  switch(cmd.action) {
+    case 'load':
+      var url = cmd.data && cmd.data.url;
+      var mode = cmd.data && cmd.data.mode;
+      if (!url) return;
+      if (mode === 'replace') {
+        browserPlaylist = [url];
+        browserPlaylistPos = 0;
+        audioEl.src = url;
+        audioEl.play().catch(function(){});
+      } else if (mode === 'append' || mode === 'append-play') {
+        browserPlaylist.push(url);
+        if (browserPlaylist.length === 1 || mode === 'append-play') {
+          browserPlaylistPos = browserPlaylist.length - 1;
+          audioEl.src = url;
+          audioEl.play().catch(function(){});
+        }
+      }
+      break;
+    case 'play':
+      audioEl.play().catch(function(){});
+      break;
+    case 'pause':
+      audioEl.pause();
+      break;
+    case 'stop':
+      audioEl.pause();
+      audioEl.currentTime = 0;
+      break;
+    case 'seek':
+      var pos = cmd.data && cmd.data.position;
+      if (typeof pos === 'number') audioEl.currentTime = pos;
+      break;
+    case 'next':
+      if (browserPlaylistPos < browserPlaylist.length - 1) {
+        browserPlaylistPos++;
+        audioEl.src = browserPlaylist[browserPlaylistPos];
+        audioEl.play().catch(function(){});
+      }
+      break;
+    case 'prev':
+      if (browserPlaylistPos > 0) {
+        browserPlaylistPos--;
+        audioEl.src = browserPlaylist[browserPlaylistPos];
+        audioEl.play().catch(function(){});
+      }
+      break;
+    case 'clear':
+      browserPlaylist = [];
+      browserPlaylistPos = -1;
+      audioEl.pause();
+      audioEl.removeAttribute('src');
+      break;
+    case 'playlist-remove':
+      var idx = cmd.data && cmd.data.index;
+      if (typeof idx === 'number' && idx >= 0 && idx < browserPlaylist.length) {
+        browserPlaylist.splice(idx, 1);
+        if (idx < browserPlaylistPos) browserPlaylistPos--;
+        else if (idx === browserPlaylistPos) {
+          if (browserPlaylistPos < browserPlaylist.length) {
+            audioEl.src = browserPlaylist[browserPlaylistPos];
+            audioEl.play().catch(function(){});
+          } else {
+            browserPlaylistPos = -1;
+            audioEl.pause();
+            audioEl.removeAttribute('src');
+          }
+        }
+      }
+      break;
+    case 'playlist-move':
+      var from = cmd.data && cmd.data.from;
+      var to = cmd.data && cmd.data.to;
+      if (typeof from === 'number' && typeof to === 'number') {
+        var item = browserPlaylist.splice(from, 1)[0];
+        browserPlaylist.splice(to, 0, item);
+        // Update current pos
+        if (browserPlaylistPos === from) browserPlaylistPos = to;
+        else {
+          if (from < browserPlaylistPos && to >= browserPlaylistPos) browserPlaylistPos--;
+          else if (from > browserPlaylistPos && to <= browserPlaylistPos) browserPlaylistPos++;
+        }
+      }
+      break;
+    case 'set-property':
+      var name = cmd.data && cmd.data.name;
+      var val = cmd.data && cmd.data.value;
+      if (name === 'playlist-pos' && typeof val === 'number') {
+        browserPlaylistPos = val;
+        if (val >= 0 && val < browserPlaylist.length) {
+          audioEl.src = browserPlaylist[browserPlaylistPos];
+          audioEl.play().catch(function(){});
+        }
+      }
+      break;
+    case 'handoff':
+      var pos = cmd.data && cmd.data.playlist_pos || 0;
+      var timePos = cmd.data && cmd.data.time_pos || 0;
+      var paused = cmd.data && cmd.data.paused;
+      if (pos >= 0 && pos < browserPlaylist.length) {
+        browserPlaylistPos = pos;
+        audioEl.src = browserPlaylist[pos];
+        audioEl.currentTime = timePos;
+        if (!paused) audioEl.play().catch(function(){});
+      }
+      break;
+  }
+}
+
+// Auto-advance to next track when current ends
+audioEl.addEventListener('ended', function() {
+  if (browserPlaylistPos < browserPlaylist.length - 1) {
+    browserPlaylistPos++;
+    audioEl.src = browserPlaylist[browserPlaylistPos];
+    audioEl.play().catch(function(){});
+  }
+});
+
 // ========== INIT ==========
 loadArtists();
 refresh();
 setInterval(refresh, 800);
 tickSeek();
+registerBrowserDevice();
 
 })();
 </script>

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/carnager/subclerk/internal/shared"
@@ -18,7 +21,50 @@ Commands:
   next      Next track
   update    Rebuild library cache
   status    Show current playback status
+  devices   List connected devices
+  device    Switch active device: device <name>
 `
+
+var (
+	baseURL string
+	client  *http.Client
+)
+
+func initClient() {
+	var useLocal bool
+	var socketPath string
+	var err error
+	baseURL, useLocal, socketPath, err = shared.APIBaseURLFromAddress("local")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if useLocal {
+		client = shared.NewLocalHTTPClient(5*time.Second, socketPath)
+	} else {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+}
+
+func apiDo(method, path string, body string) ([]byte, error) {
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, baseURL+"/"+path, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -26,58 +72,123 @@ func main() {
 		os.Exit(1)
 	}
 
+	initClient()
 	cmd := os.Args[1]
 
-	var method, path string
 	switch cmd {
 	case "prev":
-		method, path = "POST", "playback/prev"
+		apiDo("POST", "playback/prev", "")
 	case "toggle":
-		method, path = "POST", "playback/play"
+		apiDo("POST", "playback/play", "")
 	case "stop":
-		method, path = "POST", "playback/stop"
+		apiDo("POST", "playback/stop", "")
 	case "next":
-		method, path = "POST", "playback/next"
+		apiDo("POST", "playback/next", "")
 	case "update":
-		method, path = "POST", "cache/update"
+		apiDo("POST", "cache/update", "")
 	case "status":
-		method, path = "GET", "playback/status"
+		data, err := apiDo("GET", "playback/status", "")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(string(data))
+	case "devices":
+		cmdDevices()
+	case "device":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: subclerkc device <name>")
+			os.Exit(1)
+		}
+		cmdDeviceSwitch(strings.Join(os.Args[2:], " "))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
 	}
+}
 
-	baseURL, useLocal, socketPath, err := shared.APIBaseURLFromAddress("local")
+type deviceInfo struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	IsLocal  bool   `json:"is_local"`
+	Online   bool   `json:"online"`
+	Format   string `json:"format"`
+	BitRate  int    `json:"max_bitrate"`
+}
+
+type activeDevice struct {
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+}
+
+func cmdDevices() {
+	data, err := apiDo("GET", "devices", "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-
-	var client *http.Client
-	if useLocal {
-		client = shared.NewLocalHTTPClient(5*time.Second, socketPath)
-	} else {
-		client = &http.Client{Timeout: 5 * time.Second}
+	var devs []deviceInfo
+	if err := json.Unmarshal(data, &devs); err != nil {
+		fmt.Fprintf(os.Stderr, "error parsing devices: %v\n", err)
+		os.Exit(1)
 	}
 
-	url := baseURL + "/" + path
-	req, err := http.NewRequest(method, url, nil)
+	actData, _ := apiDo("GET", "devices/active", "")
+	var act activeDevice
+	json.Unmarshal(actData, &act)
+
+	if len(devs) == 0 {
+		fmt.Println("No devices connected")
+		return
+	}
+
+	for _, d := range devs {
+		status := "offline"
+		if d.Online {
+			status = "online"
+		}
+		active := " "
+		if d.ID == act.DeviceID {
+			active = "*"
+		}
+		local := ""
+		if d.IsLocal {
+			local = " (local)"
+		}
+		detail := ""
+		if d.Format != "" {
+			detail = " [" + d.Format
+			if d.BitRate > 0 {
+				detail += fmt.Sprintf(" %dk", d.BitRate)
+			}
+			detail += "]"
+		}
+		fmt.Printf(" %s %-20s %-8s%s%s\n", active, d.Name, status, local, detail)
+	}
+}
+
+func cmdDeviceSwitch(name string) {
+	data, err := apiDo("GET", "devices", "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	var devs []deviceInfo
+	json.Unmarshal(data, &devs)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+	name = strings.ToLower(name)
+	for _, d := range devs {
+		if strings.ToLower(d.Name) == name {
+			_, err := apiDo("POST", "devices/active", fmt.Sprintf(`{"device_id":"%s"}`, d.ID))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Switched to: %s\n", d.Name)
+			return
+		}
 	}
-	defer resp.Body.Close()
-
-	if cmd == "status" {
-		buf := make([]byte, 4096)
-		n, _ := resp.Body.Read(buf)
-		fmt.Print(string(buf[:n]))
-	}
+	fmt.Fprintf(os.Stderr, "device not found: %s\n", name)
+	os.Exit(1)
 }

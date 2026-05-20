@@ -6,3 +6,4 @@ go build -o bin/subclerk-tui ./cmd/subclerk-tui/
 go build -o bin/subclerkc ./cmd/subclerkc/
 go build -o bin/subclerk-rofi ./cmd/subclerk-rofi/
 go build -o bin/subclerk-musiclist ./cmd/subclerk-musiclist/
+go build -o bin/subclerk-agent ./cmd/subclerk-agent/

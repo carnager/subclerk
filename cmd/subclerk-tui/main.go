@@ -2,31 +2,150 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/carnager/subclerk/internal/shared"
+	"github.com/mattn/go-runewidth"
 )
 
 // ---------------------------------------------------------------------------
-// API client
+// Config
+// ---------------------------------------------------------------------------
+
+type tuiConfig struct {
+	Master string `toml:"master"` // e.g. "local", "192.168.1.10:6701"
+}
+
+var cfg tuiConfig
+
+func loadTUIConfig() tuiConfig {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return tuiConfig{}
+	}
+	xdgConfig := shared.Getenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	configPath := filepath.Join(xdgConfig, "subclerk", "subclerk-tui.toml")
+
+	_ = os.MkdirAll(filepath.Dir(configPath), 0o755)
+
+	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
+		_ = os.WriteFile(configPath, []byte("master = \"local\"\n"), 0o644)
+	}
+
+	var c tuiConfig
+	if _, err := toml.DecodeFile(configPath, &c); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: config: %v\n", err)
+	}
+	if c.Master == "" {
+		c.Master = "local"
+	}
+	return c
+}
+
+// ---------------------------------------------------------------------------
+// Ensure agent is running (spawn detached if not)
+// ---------------------------------------------------------------------------
+
+func ensureAgent() {
+	// Check if agent is reachable by reading its config for the bind address
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	xdgConfig := shared.Getenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	agentConfigPath := filepath.Join(xdgConfig, "subclerk", "subclerk-agent.toml")
+
+	// Read agent bind address from config (default 0.0.0.0:6703)
+	agentAddr := "127.0.0.1:6702"
+	if _, err := os.Stat(agentConfigPath); err == nil {
+		var raw map[string]any
+		if _, err := toml.DecodeFile(agentConfigPath, &raw); err == nil {
+			if agent, ok := raw["agent"].(map[string]any); ok {
+				if bind, ok := agent["bind"].(string); ok && bind != "" {
+					// Replace 0.0.0.0 with 127.0.0.1 for health check
+					agentAddr = strings.Replace(bind, "0.0.0.0", "127.0.0.1", 1)
+				}
+			}
+		}
+	}
+
+	// Try to reach the agent health endpoint
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + agentAddr + "/agent/v1/health")
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return // agent already running
+		}
+	}
+
+	// Agent not running — find the binary and spawn it detached
+	agentBin := findAgentBinary()
+	if agentBin == "" {
+		fmt.Fprintln(os.Stderr, "warning: subclerk-agent not found in PATH or next to this binary")
+		return
+	}
+
+	cmd := exec.Command(agentBin)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	// Detach from parent process
+	cmd.SysProcAttr = detachedProcAttr()
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to start agent: %v\n", err)
+		return
+	}
+	// Release so the agent lives on after TUI exits
+	_ = cmd.Process.Release()
+}
+
+func findAgentBinary() string {
+	// Check PATH first
+	if p, err := exec.LookPath("subclerk-agent"); err == nil {
+		return p
+	}
+	// Check next to our own binary
+	self, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	candidate := filepath.Join(filepath.Dir(self), "subclerk-agent")
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return ""
+}
+
+func detachedProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setsid: true}
+}
+
+// ---------------------------------------------------------------------------
+// API client (talks to master)
 // ---------------------------------------------------------------------------
 
 var httpClient *http.Client
 var apiBase string
 
 func initAPI() {
-	base, useLocal, sock, err := shared.APIBaseURLFromAddress("local")
+	base, useLocal, sock, err := shared.APIBaseURLFromAddress(cfg.Master)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -83,6 +202,7 @@ type playbackStatus struct {
 
 type queueItem struct {
 	Position int     `json:"position"`
+	SongID   string  `json:"song_id"`
 	Title    string  `json:"title"`
 	Artist   string  `json:"artist"`
 	Album    string  `json:"album"`
@@ -95,6 +215,20 @@ type albumEntry struct {
 	AlbumArtist string `json:"albumartist"`
 	Album       string `json:"album"`
 	Date        string `json:"date"`
+}
+
+type deviceInfo struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	IsLocal  bool   `json:"is_local"`
+	Online   bool   `json:"online"`
+	Format   string `json:"format"`
+	BitRate  int    `json:"max_bitrate"`
+}
+
+type activeDeviceInfo struct {
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
 }
 
 type trackEntry struct {
@@ -128,6 +262,11 @@ type albumsMsg []albumEntry
 type tracksMsg []trackEntry
 
 type searchMsg searchResult
+
+type devicesMsg struct {
+	devices []deviceInfo
+	active  string // active device ID
+}
 
 type ratingInfo struct {
 	Rating      string `json:"rating"`
@@ -182,23 +321,34 @@ type model struct {
 	libOffset  int
 
 	// queue
-	qCursor int
-	qOffset int
-	qSelected map[int]bool // selected queue positions
+	qCursor      int
+	qOffset      int
+	qSelected    map[int]bool // selected queue positions
+	confirmClear bool
+	qVisited     bool   // has the user tabbed to queue at least once
+	qFirstSongID string // first song ID to detect queue replacement
 
 	// search
 	searching   bool
 	searchInput textinput.Model
 	searchRes   searchResult
 	srCursor    int
+	srOffset    int
 	srTotal     int
 
 	// action menu
 	showMenu   bool
 	menuCursor int
+	menuSource string // "library" or "search"
 
 	// help
 	showHelp bool
+
+	// devices
+	showDevices  bool
+	devices      []deviceInfo
+	activeDevice string // active device ID
+	devCursor    int
 
 	// rating
 	showRating   bool
@@ -275,6 +425,21 @@ func doSearch(q string) tea.Cmd {
 		var res searchResult
 		_ = apiJSON("GET", "search?q="+url.QueryEscape(q), "", &res)
 		return searchMsg(res)
+	}
+}
+
+func fetchDevices() tea.Msg {
+	var devs []deviceInfo
+	_ = apiJSON("GET", "devices", "", &devs)
+	var act activeDeviceInfo
+	_ = apiJSON("GET", "devices/active", "", &act)
+	return devicesMsg{devices: devs, active: act.DeviceID}
+}
+
+func setActiveDevice(id string) tea.Cmd {
+	return func() tea.Msg {
+		apiCall("POST", "devices/active", fmt.Sprintf(`{"device_id":"%s"}`, id))
+		return fetchDevices()
 	}
 }
 
@@ -361,6 +526,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusMsg:
 		m.status = msg.status
+		// Detect queue replacement
+		newFirstID := ""
+		if len(msg.queue) > 0 {
+			newFirstID = msg.queue[0].SongID
+		}
+		if newFirstID != m.qFirstSongID {
+			m.qCursor = 0
+			m.qOffset = 0
+			m.qSelected = nil
+			m.qFirstSongID = newFirstID
+		}
 		m.queue = msg.queue
 		return m, nil
 
@@ -388,6 +564,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.searchRes = searchResult(msg)
 		m.srTotal = len(m.searchRes.Albums) + len(m.searchRes.Tracks)
 		m.srCursor = 0
+		return m, nil
+
+	case devicesMsg:
+		m.devices = msg.devices
+		m.activeDevice = msg.active
 		return m, nil
 
 	case ratingMsg:
@@ -458,6 +639,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Device picker mode
+	if m.showDevices {
+		return m.handleDeviceKey(key)
+	}
+
 	// Rating mode
 	if m.showRating {
 		return m.handleRatingKey(key)
@@ -510,6 +696,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.showHelp = true
 		return m, nil
+	case "D":
+		m.showDevices = true
+		m.devCursor = 0
+		return m, tea.Cmd(fetchDevices)
 	case "tab":
 		if m.focus == panelLibrary {
 			m.focus = panelQueue
@@ -529,6 +719,14 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 var menuOptions = []string{"Add to queue", "Insert after current", "Replace queue", "Browse into"}
 
 func (m model) menuOptionCount() int {
+	if m.menuSource == "search" {
+		idx := m.srCursor
+		nAlbums := len(m.searchRes.Albums)
+		if idx < nAlbums {
+			return 4 // albums can browse into
+		}
+		return 3 // tracks: no browse
+	}
 	if m.libMode == libTracks {
 		return 3 // no "Browse into" for tracks
 	}
@@ -553,15 +751,28 @@ func (m model) handleMenuKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		m.showMenu = false
-		switch m.menuCursor {
-		case 0:
-			return m.libAction("add")
-		case 1:
-			return m.libAction("insert")
-		case 2:
-			return m.libAction("replace")
-		case 3:
-			return m.libDrillIn()
+		if m.menuSource == "search" {
+			switch m.menuCursor {
+			case 0:
+				return m.searchAction("add")
+			case 1:
+				return m.searchAction("insert")
+			case 2:
+				return m.searchAction("replace")
+			case 3:
+				return m.searchDrillIn()
+			}
+		} else {
+			switch m.menuCursor {
+			case 0:
+				return m.libAction("add")
+			case 1:
+				return m.libAction("insert")
+			case 2:
+				return m.libAction("replace")
+			case 3:
+				return m.libDrillIn()
+			}
 		}
 	}
 	return m, nil
@@ -641,6 +852,7 @@ func (m model) handleLibKey(key string) (tea.Model, tea.Cmd) {
 		}
 		m.showMenu = true
 		m.menuCursor = 0
+		m.menuSource = "library"
 		return m, nil
 	case "l", "right":
 		return m.libDrillIn()
@@ -753,6 +965,13 @@ func (m model) libAction(mode string) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleQueueKey(key string) (tea.Model, tea.Cmd) {
+	if m.confirmClear {
+		m.confirmClear = false
+		if key == "y" || key == "Y" {
+			return m, doDelete("playback/queue")
+		}
+		return m, nil
+	}
 	qLen := len(m.queue)
 	switch key {
 	case "j", "down":
@@ -890,6 +1109,9 @@ func (m model) handleQueueKey(key string) (tea.Model, tea.Cmd) {
 			m.qCursor--
 			return m, doPost("playback/queue/move", body)
 		}
+	case "c":
+		m.confirmClear = true
+		return m, nil
 	}
 	return m, nil
 }
@@ -910,11 +1132,12 @@ func (m model) handleSearchKey(msg tea.KeyMsg, key string) (tea.Model, tea.Cmd) 
 		}
 		return m, nil
 	case "enter":
-		return m.searchAction("add")
-	case "shift+enter":
-		return m.searchAction("replace")
-	case "tab":
-		return m.searchAction("insert")
+		if m.srTotal > 0 {
+			m.showMenu = true
+			m.menuCursor = 0
+			m.menuSource = "search"
+		}
+		return m, nil
 	}
 
 	// Forward to text input
@@ -945,6 +1168,45 @@ func (m model) searchAction(mode string) (tea.Model, tea.Cmd) {
 	}
 	m.searching = false
 	return m, cmd
+}
+
+func (m model) searchDrillIn() (tea.Model, tea.Cmd) {
+	if m.srTotal == 0 {
+		return m, nil
+	}
+	idx := m.srCursor
+	nAlbums := len(m.searchRes.Albums)
+	if idx < nAlbums {
+		a := m.searchRes.Albums[idx]
+		m.searching = false
+		return m, fetchTracks(a.ID)
+	}
+	return m, nil
+}
+
+func (m model) handleDeviceKey(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "esc", "q", "D":
+		m.showDevices = false
+		return m, nil
+	case "j", "down":
+		if m.devCursor < len(m.devices)-1 {
+			m.devCursor++
+		}
+		return m, nil
+	case "k", "up":
+		if m.devCursor > 0 {
+			m.devCursor--
+		}
+		return m, nil
+	case "enter":
+		if m.devCursor < len(m.devices) {
+			dev := m.devices[m.devCursor]
+			m.showDevices = false
+			return m, setActiveDevice(dev.ID)
+		}
+	}
+	return m, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -982,14 +1244,17 @@ func (m model) View() string {
 	if m.showHelp {
 		return m.helpView()
 	}
+	if m.showDevices {
+		return m.deviceView()
+	}
+	if m.showMenu {
+		return m.menuView()
+	}
 	if m.searching {
 		return m.searchView()
 	}
 	if m.showRating {
 		return m.ratingView()
-	}
-	if m.showMenu {
-		return m.menuView()
 	}
 
 	playerH := 3
@@ -1108,7 +1373,12 @@ func (m model) backRow(w int, label string) string {
 }
 
 func (m model) queueView(w, h int) string {
-	title := fmt.Sprintf("Queue (%d)", len(m.queue))
+	var title string
+	if m.confirmClear {
+		title = lipgloss.NewStyle().Bold(true).Foreground(dangerColor).Render("Clear queue? [y/N]")
+	} else {
+		title = fmt.Sprintf("Queue (%d)", len(m.queue))
+	}
 	hdr := headerStyle.Width(w).Render(title)
 	visH := h - 1
 	if visH < 1 {
@@ -1141,9 +1411,9 @@ func (m model) queueView(w, h int) string {
 		album := truncate(q.Album, albumW)
 
 		// Pad columns
-		artist = artist + strings.Repeat(" ", artistW-len([]rune(artist)))
-		title = title + strings.Repeat(" ", titleW-len([]rune(title)))
-		album = album + strings.Repeat(" ", albumW-len([]rune(album)))
+		artist = padRight(artist, artistW)
+		title = padRight(title, titleW)
+		album = padRight(album, albumW)
 
 		isCursor := m.focus == panelQueue && i == m.qCursor
 		isSelected := m.qSelected[i]
@@ -1158,10 +1428,22 @@ func (m model) queueView(w, h int) string {
 			s = s.Background(selectedBg).Foreground(lipgloss.Color("#ffffff")).Bold(true)
 		}
 		marker := " "
-		if isSelected {
+		if q.Current && isCursor {
+			marker = "\u25b6"
+		} else if q.Current {
+			marker = lipgloss.NewStyle().Foreground(accentColor).Render("\u25b6")
+		} else if isSelected && !isCursor {
 			marker = lipgloss.NewStyle().Foreground(accentColor).Render("*")
+		} else if isSelected {
+			marker = "*"
 		}
-		row := marker + dimStyle.Render(num) + " " + artist + " " + title + " " + dimStyle.Render(album) + " " + dimStyle.Render(dur)
+		var row string
+		if isCursor {
+			// Plain text — let outer style handle all coloring
+			row = marker + num + " " + artist + " " + title + " " + album + " " + dur
+		} else {
+			row = marker + dimStyle.Render(num) + " " + artist + " " + title + " " + dimStyle.Render(album) + " " + dimStyle.Render(dur)
+		}
 		items = append(items, s.Render(row))
 	}
 
@@ -1235,7 +1517,7 @@ func (m model) playerView() string {
 	line2 := timeL + " " + bar + " " + timeR
 
 	// Hotkey hints
-	hints := dimStyle.Render("[/]search [?]help [space]play [<>]prev/next [s]stop [r]album [R]tracks [T]rate [A]rate album [q]quit")
+	hints := dimStyle.Render("[/]search [?]help [space]play [<>]prev/next [s]stop [r]album [R]tracks [T]rate [A]rate album [D]devices [q]quit")
 
 	return line1 + "\n" + line2 + "\n" + hints
 }
@@ -1255,6 +1537,7 @@ func (m model) helpView() string {
 			"  u          Update library cache",
 			"  T          Rate current track",
 			"  A          Rate current album",
+			"  D          Device picker",
 			"  Tab        Switch panel focus",
 			"  q          Quit",
 		}, "\n")},
@@ -1272,6 +1555,7 @@ func (m model) helpView() string {
 			"  V          Select range",
 			"  Esc        Clear selection",
 			"  J/K        Move track down/up",
+			"  c          Clear queue (confirm)",
 			"  PgUp/PgDn  Jump 20 items",
 			"  g/G        Go to first/last",
 		}, "\n")},
@@ -1341,6 +1625,68 @@ func (m model) ratingView() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
+func (m model) deviceView() string {
+	header := titleStyle.Render("Devices") + "\n\n"
+
+	if len(m.devices) == 0 {
+		header += dimStyle.Render("No devices found")
+	}
+
+	var items []string
+	for i, d := range m.devices {
+		status := dimStyle.Render("\u25cb") // offline circle
+		if d.Online {
+			status = lipgloss.NewStyle().Foreground(lipgloss.Color("#22c55e")).Render("\u25cf") // green dot
+		}
+		active := "  "
+		if d.ID == m.activeDevice {
+			active = lipgloss.NewStyle().Foreground(accentColor).Render("\u25b6 ")
+		}
+
+		name := d.Name
+		if d.IsLocal {
+			name += " (local)"
+		}
+		detail := ""
+		if d.Format != "" {
+			detail = d.Format
+			if d.BitRate > 0 {
+				detail += fmt.Sprintf(" %dkbps", d.BitRate)
+			}
+		}
+		if detail != "" {
+			name += "  " + dimStyle.Render(detail)
+		}
+
+		isCursor := i == m.devCursor
+		s := lipgloss.NewStyle()
+		if isCursor {
+			s = s.Background(selectedBg).Foreground(lipgloss.Color("#ffffff")).Bold(true)
+			line := " " + active + status + " " + d.Name
+			if d.IsLocal {
+				line += " (local)"
+			}
+			if detail != "" {
+				line += "  " + detail
+			}
+			items = append(items, s.Render(line))
+		} else {
+			items = append(items, " "+active+status+" "+name)
+		}
+	}
+
+	hints := "\n\n" + dimStyle.Render("[\u2191\u2193]navigate [enter]switch [esc]close")
+	content := header + strings.Join(items, "\n") + hints
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accentColor).
+		Padding(1, 3).
+		Render(content)
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
 func (m model) menuView() string {
 	// Determine what we're acting on
 	di := m.dataIndex()
@@ -1398,53 +1744,81 @@ func (m model) searchView() string {
 	w := m.width
 	h := m.height
 
-	inputView := m.searchInput.View()
-	header := titleStyle.Render("Search") + "\n" + inputView + "\n"
+	// Input line at top
+	prompt := titleStyle.Render("> ") + m.searchInput.View()
+	hints := dimStyle.Render("[esc]close [\u2191\u2193]navigate [enter]action menu")
 
+	// Available height for results (minus prompt line and hints line)
+	resH := h - 2
+	if resH < 1 {
+		resH = 1
+	}
+
+	// Build flat result list with cursor visual index tracking
 	var items []string
+	cursorVisual := 0
 	nAlbums := len(m.searchRes.Albums)
 	if nAlbums > 0 {
-		items = append(items, dimStyle.Render(fmt.Sprintf("  Albums (%d)", nAlbums)))
+		items = append(items, dimStyle.Render(fmt.Sprintf(" Albums (%d)", nAlbums)))
 		for i, a := range m.searchRes.Albums {
+			if i == m.srCursor {
+				cursorVisual = len(items)
+			}
 			label := a.AlbumArtist + " \u2014 " + a.Album
 			if a.Date != "" {
 				label += " (" + a.Date + ")"
 			}
-			items = append(items, m.srRow(i, truncate(label, w-6)))
+			items = append(items, m.srRow(i, label, w))
 		}
 	}
 	if len(m.searchRes.Tracks) > 0 {
-		items = append(items, dimStyle.Render(fmt.Sprintf("  Tracks (%d)", len(m.searchRes.Tracks))))
+		items = append(items, dimStyle.Render(fmt.Sprintf(" Tracks (%d)", len(m.searchRes.Tracks))))
 		for i, t := range m.searchRes.Tracks {
+			if nAlbums+i == m.srCursor {
+				cursorVisual = len(items)
+			}
 			label := t.Title + " \u2014 " + t.Artist
-			items = append(items, m.srRow(nAlbums+i, truncate(label, w-6)))
+			items = append(items, m.srRow(nAlbums+i, label, w))
 		}
 	}
 
-	body := strings.Join(items, "\n")
+	// Scroll to keep cursor visible
+	m.srOffset = scrollOffset(cursorVisual, m.srOffset, resH, len(items))
+	end := m.srOffset + resH
+	if end > len(items) {
+		end = len(items)
+	}
+
+	var body string
 	if m.srTotal == 0 && strings.TrimSpace(m.searchInput.Value()) != "" {
-		body = dimStyle.Render("  No results")
+		body = dimStyle.Render(" No results")
+		for i := 1; i < resH; i++ {
+			body += "\n"
+		}
+	} else if len(items) > 0 {
+		visible := items[m.srOffset:end]
+		body = strings.Join(visible, "\n")
+		for i := len(visible); i < resH; i++ {
+			body += "\n"
+		}
+	} else {
+		for i := 0; i < resH; i++ {
+			if i > 0 {
+				body += "\n"
+			}
+		}
 	}
 
-	hints := dimStyle.Render("[esc]close [\u2191\u2193]navigate [enter]add [shift+enter]replace [tab]insert")
-
-	result := header + "\n" + body
-	// Pad to fill
-	lines := strings.Count(result, "\n") + 1
-	for lines < h-1 {
-		result += "\n"
-		lines++
-	}
-	return result + "\n" + hints
+	return prompt + "\n" + body + "\n" + hints
 }
 
-func (m model) srRow(idx int, text string) string {
-	prefix := "  "
+func (m model) srRow(idx int, text string, w int) string {
+	s := lipgloss.NewStyle().Width(w)
 	if idx == m.srCursor {
-		prefix = "\u25b8 "
-		return lipgloss.NewStyle().Background(selectedBg).Foreground(lipgloss.Color("#ffffff")).Bold(true).Render(prefix + text)
+		s = s.Background(selectedBg).Foreground(lipgloss.Color("#ffffff")).Bold(true)
+		return s.Render(" " + truncate(text, w-2))
 	}
-	return prefix + text
+	return s.Render(" " + truncate(text, w-2))
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,15 +1838,25 @@ func truncate(s string, max int) string {
 	if max < 1 {
 		return ""
 	}
-	// Count runes (approximate, good enough for typical terminal text)
-	runes := []rune(s)
-	if len(runes) <= max {
+	if runewidth.StringWidth(s) <= max {
 		return s
 	}
-	if max <= 3 {
-		return string(runes[:max])
+	if max <= 1 {
+		return "\u2026"
 	}
-	return string(runes[:max-1]) + "\u2026"
+	return runewidth.Truncate(s, max-1, "") + "\u2026"
+}
+
+func strWidth(s string) int {
+	return runewidth.StringWidth(s)
+}
+
+func padRight(s string, w int) string {
+	sw := runewidth.StringWidth(s)
+	if sw >= w {
+		return s
+	}
+	return s + strings.Repeat(" ", w-sw)
 }
 
 func scrollOffset(cursor, offset, visible, total int) int {
@@ -1495,7 +1879,10 @@ func scrollOffset(cursor, offset, visible, total int) int {
 // ---------------------------------------------------------------------------
 
 func main() {
+	cfg = loadTUIConfig()
 	initAPI()
+	ensureAgent()
+
 	p := tea.NewProgram(newModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

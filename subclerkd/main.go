@@ -45,6 +45,7 @@ type config struct {
 	MPV struct {
 		Socket     string `toml:"socket"`
 		Executable string `toml:"executable"`
+		ReplayGain string `toml:"replaygain"` // "off", "track", "album"
 	} `toml:"mpv"`
 	Random struct {
 		Tracks int `toml:"tracks"`
@@ -124,6 +125,13 @@ type subAlbumDetail struct {
 	Songs  []subSong `json:"song"`
 }
 
+type subReplayGain struct {
+	TrackGain float64 `json:"trackGain"`
+	AlbumGain float64 `json:"albumGain"`
+	TrackPeak float64 `json:"trackPeak"`
+	AlbumPeak float64 `json:"albumPeak"`
+}
+
 type subSong struct {
 	ID         string `json:"id"`
 	Title      string `json:"title"`
@@ -137,6 +145,7 @@ type subSong struct {
 	Path       string `json:"path"`
 	UserRating int    `json:"userRating,omitempty"`
 	Created    string `json:"created"`
+	ReplayGain subReplayGain `json:"replayGain"`
 }
 
 type subScanStatus struct {
@@ -156,6 +165,7 @@ type subNowPlaying struct {
 type mpvClient struct {
 	socketPath string
 	executable string
+	replaygain string
 	mu         sync.Mutex
 	process    *exec.Cmd
 	reqID      int
@@ -170,6 +180,334 @@ type mpvResponse struct {
 	Data      any    `json:"data"`
 	Error     string `json:"error"`
 	RequestID int    `json:"request_id"`
+}
+
+// ---------------------------------------------------------------------------
+// Playback target interface
+// ---------------------------------------------------------------------------
+
+type playbackTarget interface {
+	loadFile(url, mode string, meta map[string]any) error
+	playlistClear() error
+	playlistRemove(index int) error
+	playlistMove(from, to int) error
+	getProperty(name string) (any, error)
+	setProperty(name string, value any) error
+	command(args ...any) (*mpvResponse, error)
+	isRunning() bool
+}
+
+// remoteTarget talks to a subclerk-agent over HTTP.
+type remoteTarget struct {
+	address string
+	client  *http.Client
+}
+
+func (rt *remoteTarget) loadFile(url, mode string, meta map[string]any) error {
+	body, _ := json.Marshal(map[string]string{"url": url, "mode": mode})
+	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/load", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent load: http %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (rt *remoteTarget) playlistClear() error {
+	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/playlist-clear", "application/json", nil)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent playlist-clear: http %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (rt *remoteTarget) playlistRemove(index int) error {
+	body, _ := json.Marshal(map[string]int{"index": index})
+	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/playlist-remove", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent playlist-remove: http %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (rt *remoteTarget) playlistMove(from, to int) error {
+	body, _ := json.Marshal(map[string]int{"from": from, "to": to})
+	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/playlist-move", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent playlist-move: http %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (rt *remoteTarget) getProperty(name string) (any, error) {
+	resp, err := rt.client.Get("http://" + rt.address + "/agent/v1/status")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("agent status: http %d", resp.StatusCode)
+	}
+	var status map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	// Map mpv property names to agent status keys
+	keyMap := map[string]string{
+		"pause":        "pause",
+		"time-pos":     "time_pos",
+		"duration":     "duration",
+		"playlist-pos": "playlist_pos",
+	}
+	if mapped, ok := keyMap[name]; ok {
+		return status[mapped], nil
+	}
+	return status[name], nil
+}
+
+func (rt *remoteTarget) setProperty(name string, value any) error {
+	// Map specific properties to dedicated endpoints for play/pause
+	if name == "pause" {
+		endpoint := "/agent/v1/pause"
+		if v, ok := value.(bool); ok && !v {
+			endpoint = "/agent/v1/play"
+		}
+		resp, err := rt.client.Post("http://"+rt.address+endpoint, "application/json", nil)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("agent set-property: http %d", resp.StatusCode)
+		}
+		return nil
+	}
+	if name == "time-pos" {
+		body, _ := json.Marshal(map[string]any{"position": value})
+		resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/seek", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("agent seek: http %d", resp.StatusCode)
+		}
+		return nil
+	}
+	body, _ := json.Marshal(map[string]any{"name": name, "value": value})
+	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/set-property", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent set-property: http %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (rt *remoteTarget) command(args ...any) (*mpvResponse, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("empty command")
+	}
+	cmd := fmt.Sprintf("%v", args[0])
+	switch cmd {
+	case "playlist-next":
+		resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/next", "application/json", nil)
+		if err != nil {
+			return nil, err
+		}
+		resp.Body.Close()
+		return &mpvResponse{}, nil
+	case "playlist-prev":
+		resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/prev", "application/json", nil)
+		if err != nil {
+			return nil, err
+		}
+		resp.Body.Close()
+		return &mpvResponse{}, nil
+	case "playlist-clear":
+		if err := rt.playlistClear(); err != nil {
+			return nil, err
+		}
+		return &mpvResponse{}, nil
+	case "playlist-move":
+		if len(args) >= 3 {
+			from := shared.IntFromAny(args[1], 0)
+			to := shared.IntFromAny(args[2], 0)
+			if err := rt.playlistMove(from, to); err != nil {
+				return nil, err
+			}
+		}
+		return &mpvResponse{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported remote command: %s", cmd)
+	}
+}
+
+func (rt *remoteTarget) handoff(playlistPos int, timePos float64, paused bool) error {
+	body, _ := json.Marshal(map[string]any{
+		"playlist_pos": playlistPos,
+		"time_pos":     timePos,
+		"paused":       paused,
+	})
+	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/handoff", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent handoff: http %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (rt *remoteTarget) isRunning() bool {
+	resp, err := rt.client.Get("http://" + rt.address + "/agent/v1/health")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// ---------------------------------------------------------------------------
+// Device management
+// ---------------------------------------------------------------------------
+
+type device struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Address    string    `json:"address"`
+	IsLocal    bool      `json:"is_local"`
+	Type       string    `json:"type"` // "local", "agent", "browser"
+	Format     string    `json:"format"`
+	MaxBitRate    int       `json:"max_bitrate"`
+	NavidromeURL  string    `json:"navidrome_url,omitempty"`
+	ReplayGain    string    `json:"replaygain,omitempty"` // "off", "track", "album"
+	LastSeen      time.Time `json:"last_seen"`
+	// For browser devices: SSE command channel
+	cmdCh chan browserCmd `json:"-"`
+	// For browser devices: playback state reported by browser
+	browserState   map[string]any `json:"-"`
+	browserStateMu sync.RWMutex  `json:"-"`
+}
+
+type browserCmd struct {
+	Action string         `json:"action"` // "load", "play", "pause", "stop", "seek", "clear", "set-property"
+	Data   map[string]any `json:"data,omitempty"`
+}
+
+// browserTarget pushes commands via SSE channel to a browser device.
+type browserTarget struct {
+	dev *device
+}
+
+func (bt *browserTarget) loadFile(url, mode string, meta map[string]any) error {
+	data := map[string]any{"url": url, "mode": mode}
+	if rg, ok := meta["replay_gain"]; ok && rg != nil {
+		data["replay_gain"] = rg
+	}
+	return bt.send(browserCmd{Action: "load", Data: data})
+}
+
+func (bt *browserTarget) playlistClear() error {
+	return bt.send(browserCmd{Action: "clear"})
+}
+
+func (bt *browserTarget) playlistRemove(index int) error {
+	return bt.send(browserCmd{Action: "playlist-remove", Data: map[string]any{"index": index}})
+}
+
+func (bt *browserTarget) playlistMove(from, to int) error {
+	return bt.send(browserCmd{Action: "playlist-move", Data: map[string]any{"from": from, "to": to}})
+}
+
+func (bt *browserTarget) getProperty(name string) (any, error) {
+	bt.dev.browserStateMu.RLock()
+	defer bt.dev.browserStateMu.RUnlock()
+	if bt.dev.browserState == nil {
+		return nil, fmt.Errorf("no browser state")
+	}
+	keyMap := map[string]string{
+		"pause":        "pause",
+		"time-pos":     "time_pos",
+		"duration":     "duration",
+		"playlist-pos": "playlist_pos",
+	}
+	if mapped, ok := keyMap[name]; ok {
+		return bt.dev.browserState[mapped], nil
+	}
+	return bt.dev.browserState[name], nil
+}
+
+func (bt *browserTarget) setProperty(name string, value any) error {
+	if name == "pause" {
+		if v, ok := value.(bool); ok && !v {
+			return bt.send(browserCmd{Action: "play"})
+		}
+		return bt.send(browserCmd{Action: "pause"})
+	}
+	if name == "time-pos" {
+		return bt.send(browserCmd{Action: "seek", Data: map[string]any{"position": value}})
+	}
+	if name == "playlist-pos" {
+		return bt.send(browserCmd{Action: "set-property", Data: map[string]any{"name": name, "value": value}})
+	}
+	return bt.send(browserCmd{Action: "set-property", Data: map[string]any{"name": name, "value": value}})
+}
+
+func (bt *browserTarget) command(args ...any) (*mpvResponse, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("empty command")
+	}
+	cmd := fmt.Sprintf("%v", args[0])
+	switch cmd {
+	case "playlist-next":
+		return &mpvResponse{}, bt.send(browserCmd{Action: "next"})
+	case "playlist-prev":
+		return &mpvResponse{}, bt.send(browserCmd{Action: "prev"})
+	case "playlist-clear":
+		return &mpvResponse{}, bt.send(browserCmd{Action: "clear"})
+	case "playlist-move":
+		if len(args) >= 3 {
+			return &mpvResponse{}, bt.send(browserCmd{Action: "playlist-move", Data: map[string]any{"from": args[1], "to": args[2]}})
+		}
+		return &mpvResponse{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported browser command: %s", cmd)
+	}
+}
+
+func (bt *browserTarget) isRunning() bool {
+	return bt.dev.cmdCh != nil
+}
+
+func (bt *browserTarget) send(cmd browserCmd) error {
+	if bt.dev.cmdCh == nil {
+		return fmt.Errorf("browser device not connected")
+	}
+	select {
+	case bt.dev.cmdCh <- cmd:
+		return nil
+	case <-time.After(2 * time.Second):
+		return fmt.Errorf("browser device timeout")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +531,10 @@ type app struct {
 	scrobbleLastSongID string
 	scrobbleStartTime  time.Time
 	scrobbleSubmitted  bool
+	// device management
+	devices      map[string]*device
+	devicesMu    sync.RWMutex
+	activeDevice string // device ID, "" = local
 }
 
 func main() {
@@ -209,8 +551,19 @@ func main() {
 		mpv: &mpvClient{
 			socketPath: cfg.MPV.Socket,
 			executable: cfg.MPV.Executable,
+			replaygain: cfg.MPV.ReplayGain,
 		},
 		playQueue: []string{},
+		devices: map[string]*device{
+			"local": {
+				ID:       "local",
+				Name:     "local",
+				IsLocal:  true,
+				Type:     "local",
+				LastSeen: time.Now(),
+			},
+		},
+		activeDevice: "local",
 	}
 
 	if err := a.ensureStartupState(); err != nil {
@@ -219,6 +572,7 @@ func main() {
 
 	go a.ensureMPV()
 	go a.watchNavidromeUpdates()
+	go a.deviceCleanup()
 	if a.cfg.Scrobble.Enabled {
 		go a.scrobbleLoop()
 	}
@@ -279,6 +633,7 @@ func loadConfig() (config, paths, error) {
 	cfg.Navidrome.Password = stringify(navidrome["password"])
 	cfg.MPV.Socket = stringify(mpvSection["socket"])
 	cfg.MPV.Executable = stringify(mpvSection["executable"])
+	cfg.MPV.ReplayGain = stringify(mpvSection["replaygain"])
 	cfg.Random.Tracks = intFromAny(random["tracks"], 20)
 	cfg.Cache.PollInterval = intFromAny(cache["poll_interval"], 300)
 	scrobble, _ := raw["scrobble"].(map[string]any)
@@ -299,6 +654,7 @@ password = "password"
 [mpv]
 socket = "` + defaultMPVSocket() + `"
 executable = "mpv"
+replaygain = ""
 
 [random]
 tracks = 20
@@ -476,12 +832,22 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/playback/queue/move", a.handleQueueMove)
 	mux.HandleFunc("POST /api/v1/playback/seek", a.handleSeek)
 	mux.HandleFunc("POST /api/v1/playback/queue/play/{position}", a.handleQueuePlay)
+	mux.HandleFunc("DELETE /api/v1/playback/queue", a.handleQueueClear)
 
 	// Browse & Search
 	mux.HandleFunc("GET /api/v1/browse/artists", a.handleBrowseArtists)
 	mux.HandleFunc("GET /api/v1/browse/albums", a.handleBrowseAlbums)
 	mux.HandleFunc("GET /api/v1/browse/tracks", a.handleBrowseTracks)
 	mux.HandleFunc("GET /api/v1/search", a.handleSearch)
+
+	// Device management
+	mux.HandleFunc("GET /api/v1/devices", a.handleDevicesList)
+	mux.HandleFunc("POST /api/v1/devices/register", a.handleDeviceRegister)
+	mux.HandleFunc("POST /api/v1/devices/heartbeat", a.handleDeviceHeartbeat)
+	mux.HandleFunc("POST /api/v1/devices/active", a.handleDeviceSetActive)
+	mux.HandleFunc("GET /api/v1/devices/active", a.handleDeviceGetActive)
+	mux.HandleFunc("GET /api/v1/devices/stream", a.handleDeviceSSE)
+	mux.HandleFunc("POST /api/v1/devices/status", a.handleDeviceBrowserStatus)
 
 	// Scrobble toggle
 	mux.HandleFunc("GET /api/v1/scrobble/status", a.handleScrobbleStatus)
@@ -691,8 +1057,11 @@ func (m *mpvClient) start() error {
 	}
 	_ = os.Remove(m.socketPath)
 
-	cmd := exec.Command(m.executable, "--idle", "--no-video", "--no-terminal",
-		"--input-ipc-server="+m.socketPath)
+	args := []string{"--idle", "--no-video", "--no-terminal", "--input-ipc-server=" + m.socketPath}
+	if m.replaygain != "" && m.replaygain != "off" {
+		args = append(args, "--replaygain="+m.replaygain)
+	}
+	cmd := exec.Command(m.executable, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
@@ -763,7 +1132,7 @@ func (m *mpvClient) setProperty(name string, value any) error {
 	return err
 }
 
-func (m *mpvClient) loadFile(url string, mode string) error {
+func (m *mpvClient) loadFile(url string, mode string, meta map[string]any) error {
 	_, err := m.command("loadfile", url, mode)
 	return err
 }
@@ -778,9 +1147,87 @@ func (m *mpvClient) playlistRemove(index int) error {
 	return err
 }
 
+func (m *mpvClient) playlistMove(from, to int) error {
+	_, err := m.command("playlist-move", from, to)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Playback target / device helpers
+// ---------------------------------------------------------------------------
+
+func (a *app) target() playbackTarget {
+	a.devicesMu.RLock()
+	defer a.devicesMu.RUnlock()
+	if a.activeDevice == "" || a.activeDevice == "local" {
+		return a.mpv
+	}
+	dev := a.devices[a.activeDevice]
+	if dev == nil {
+		return a.mpv
+	}
+	if dev.Type == "browser" {
+		return &browserTarget{dev: dev}
+	}
+	return &remoteTarget{address: dev.Address, client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func (a *app) activeDeviceInfo() *device {
+	a.devicesMu.RLock()
+	defer a.devicesMu.RUnlock()
+	if a.activeDevice == "" || a.activeDevice == "local" {
+		if d, ok := a.devices["local"]; ok {
+			return d
+		}
+		return &device{ID: "local", Name: "local", IsLocal: true, LastSeen: time.Now()}
+	}
+	return a.devices[a.activeDevice]
+}
+
+func (a *app) streamURLForDevice(songID, format string, maxBitRate int, navidromeURL string) string {
+	salt := randomSalt()
+	token := md5Token(a.cfg.Navidrome.Password, salt)
+	baseURL := a.cfg.Navidrome.URL
+	if navidromeURL != "" {
+		baseURL = navidromeURL
+	}
+	base := strings.TrimRight(baseURL, "/") + "/rest/stream"
+	params := url.Values{}
+	params.Set("id", songID)
+	params.Set("u", a.cfg.Navidrome.Username)
+	params.Set("t", token)
+	params.Set("s", salt)
+	params.Set("v", "1.16.1")
+	params.Set("c", "subclerk")
+	if format != "" {
+		params.Set("format", format)
+	}
+	if maxBitRate > 0 {
+		params.Set("maxBitRate", strconv.Itoa(maxBitRate))
+	}
+	return base + "?" + params.Encode()
+}
+
+func (a *app) streamURLForActiveDevice(songID string) string {
+	dev := a.activeDeviceInfo()
+	if dev == nil || dev.IsLocal {
+		return a.streamURL(songID)
+	}
+	return a.streamURLForDevice(songID, dev.Format, dev.MaxBitRate, dev.NavidromeURL)
+}
+
 // ---------------------------------------------------------------------------
 // Playback helpers
 // ---------------------------------------------------------------------------
+
+func (a *app) replayGainMeta(songID string) map[string]any {
+	if track := a.findTrackBySongID(songID); track != nil {
+		if rg, ok := track["replay_gain"].(map[string]any); ok {
+			return map[string]any{"replay_gain": rg}
+		}
+	}
+	return nil
+}
 
 func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
 	if len(songIDs) == 0 {
@@ -790,9 +1237,10 @@ func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
 	a.playQueueMu.Lock()
 	defer a.playQueueMu.Unlock()
 
+	t := a.target()
 	switch mode {
 	case "replace":
-		if err := a.mpv.playlistClear(); err != nil {
+		if err := t.playlistClear(); err != nil {
 			return err
 		}
 		a.playQueue = nil
@@ -801,28 +1249,28 @@ func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
 			if i == 0 {
 				loadMode = "replace"
 			}
-			if err := a.mpv.loadFile(a.streamURL(id), loadMode); err != nil {
+			if err := t.loadFile(a.streamURLForActiveDevice(id), loadMode, a.replayGainMeta(id)); err != nil {
 				return err
 			}
 			a.playQueue = append(a.playQueue, id)
 		}
-		return a.mpv.setProperty("pause", false)
+		return t.setProperty("pause", false)
 
 	case "insert":
-		posRaw, _ := a.mpv.getProperty("playlist-pos")
+		posRaw, _ := t.getProperty("playlist-pos")
 		pos := 0
 		if f, ok := posRaw.(float64); ok && f >= 0 {
 			pos = int(f) + 1
 		}
 		for i, id := range songIDs {
-			if err := a.mpv.loadFile(a.streamURL(id), "append"); err != nil {
+			if err := t.loadFile(a.streamURLForActiveDevice(id), "append", a.replayGainMeta(id)); err != nil {
 				return err
 			}
 			// Move from end to insert position
 			endIdx := len(a.playQueue) + i
 			targetIdx := pos + i
 			if endIdx > targetIdx {
-				a.mpv.command("playlist-move", endIdx, targetIdx)
+				t.playlistMove(endIdx, targetIdx)
 			}
 		}
 		// Update our tracking
@@ -833,11 +1281,11 @@ func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
 			newQueue = append(newQueue, a.playQueue[pos:]...)
 		}
 		a.playQueue = newQueue
-		return a.mpv.setProperty("pause", false)
+		return t.setProperty("pause", false)
 
 	default: // "add"
 		for _, id := range songIDs {
-			if err := a.mpv.loadFile(a.streamURL(id), "append"); err != nil {
+			if err := t.loadFile(a.streamURLForActiveDevice(id), "append", a.replayGainMeta(id)); err != nil {
 				return err
 			}
 			a.playQueue = append(a.playQueue, id)
@@ -850,7 +1298,7 @@ func (a *app) currentPlayingSongID() string {
 	a.playQueueMu.Lock()
 	defer a.playQueueMu.Unlock()
 
-	posRaw, err := a.mpv.getProperty("playlist-pos")
+	posRaw, err := a.target().getProperty("playlist-pos")
 	if err != nil {
 		return ""
 	}
@@ -1282,7 +1730,7 @@ func (a *app) handleRandomTracks(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (a *app) handlePlay(w http.ResponseWriter, r *http.Request) {
-	if err := a.mpv.setProperty("pause", false); err != nil {
+	if err := a.target().setProperty("pause", false); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1290,7 +1738,7 @@ func (a *app) handlePlay(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handlePause(w http.ResponseWriter, r *http.Request) {
-	if err := a.mpv.setProperty("pause", true); err != nil {
+	if err := a.target().setProperty("pause", true); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1298,16 +1746,14 @@ func (a *app) handlePause(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleStop(w http.ResponseWriter, r *http.Request) {
-	_ = a.mpv.setProperty("pause", true)
-	_, _ = a.mpv.command("stop")
-	a.playQueueMu.Lock()
-	a.playQueue = nil
-	a.playQueueMu.Unlock()
+	t := a.target()
+	_ = t.setProperty("pause", true)
+	_ = t.setProperty("time-pos", 0)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Stopped"})
 }
 
 func (a *app) handleNext(w http.ResponseWriter, r *http.Request) {
-	if _, err := a.mpv.command("playlist-next"); err != nil {
+	if _, err := a.target().command("playlist-next"); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1315,7 +1761,7 @@ func (a *app) handleNext(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handlePrev(w http.ResponseWriter, r *http.Request) {
-	if _, err := a.mpv.command("playlist-prev"); err != nil {
+	if _, err := a.target().command("playlist-prev"); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1327,7 +1773,8 @@ func (a *app) handlePlaybackStatus(w http.ResponseWriter, r *http.Request) {
 		"state": "stopped",
 	}
 
-	pauseRaw, err := a.mpv.getProperty("pause")
+	t := a.target()
+	pauseRaw, err := t.getProperty("pause")
 	if err == nil {
 		if paused, ok := pauseRaw.(bool); ok {
 			if paused {
@@ -1338,16 +1785,16 @@ func (a *app) handlePlaybackStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if posRaw, err := a.mpv.getProperty("playlist-pos"); err == nil {
+	if posRaw, err := t.getProperty("playlist-pos"); err == nil {
 		if pos, ok := posRaw.(float64); ok {
 			status["playlist_pos"] = int(pos)
 		}
 	}
 
-	if timeRaw, err := a.mpv.getProperty("time-pos"); err == nil {
+	if timeRaw, err := t.getProperty("time-pos"); err == nil {
 		status["time_pos"] = timeRaw
 	}
-	if durRaw, err := a.mpv.getProperty("duration"); err == nil {
+	if durRaw, err := t.getProperty("duration"); err == nil {
 		status["duration"] = durRaw
 	}
 
@@ -1359,6 +1806,18 @@ func (a *app) handlePlaybackStatus(w http.ResponseWriter, r *http.Request) {
 			status["artist"] = track["artist"]
 			status["album"] = track["album"]
 			status["date"] = track["date"]
+			if rg, ok := track["replay_gain"].(map[string]any); ok {
+				status["replay_gain"] = rg
+			}
+		}
+	}
+
+	// Include active device info
+	if dev := a.activeDeviceInfo(); dev != nil {
+		status["active_device"] = map[string]any{
+			"id":       dev.ID,
+			"name":     dev.Name,
+			"is_local": dev.IsLocal,
 		}
 	}
 
@@ -1371,7 +1830,7 @@ func (a *app) handleQueueGet(w http.ResponseWriter, r *http.Request) {
 	copy(queue, a.playQueue)
 	a.playQueueMu.Unlock()
 
-	posRaw, _ := a.mpv.getProperty("playlist-pos")
+	posRaw, _ := a.target().getProperty("playlist-pos")
 	currentPos := -1
 	if f, ok := posRaw.(float64); ok {
 		currentPos = int(f)
@@ -1410,7 +1869,7 @@ func (a *app) handleQueueRemove(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "position out of range"})
 		return
 	}
-	if err := a.mpv.playlistRemove(pos); err != nil {
+	if err := a.target().playlistRemove(pos); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1557,7 +2016,7 @@ func (a *app) handleSeek(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid position"})
 		return
 	}
-	if err := a.mpv.setProperty("time-pos", pos); err != nil {
+	if err := a.target().setProperty("time-pos", pos); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1588,7 +2047,7 @@ func (a *app) handleQueueMove(w http.ResponseWriter, r *http.Request) {
 	if to > from {
 		mpvTo = to + 1
 	}
-	if _, err := a.mpv.command("playlist-move", from, mpvTo); err != nil {
+	if err := a.target().playlistMove(from, mpvTo); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1625,11 +2084,23 @@ func (a *app) handleQueuePlay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "position out of range"})
 		return
 	}
-	if err := a.mpv.setProperty("playlist-pos", pos); err != nil {
+	t := a.target()
+	if err := t.setProperty("playlist-pos", pos); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	_ = t.setProperty("pause", false)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Playing"})
+}
+
+func (a *app) handleQueueClear(w http.ResponseWriter, r *http.Request) {
+	t := a.target()
+	_ = t.setProperty("pause", true)
+	_ = t.playlistClear()
+	a.playQueueMu.Lock()
+	a.playQueue = nil
+	a.playQueueMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Queue cleared"})
 }
 
 // ---------------------------------------------------------------------------
@@ -1798,6 +2269,381 @@ func (a *app) handleScrobbleToggle(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Handlers: Device management
+// ---------------------------------------------------------------------------
+
+func (a *app) handleDevicesList(w http.ResponseWriter, r *http.Request) {
+	a.devicesMu.RLock()
+	defer a.devicesMu.RUnlock()
+
+	list := make([]map[string]any, 0, len(a.devices))
+	for _, dev := range a.devices {
+		online := dev.IsLocal || time.Since(dev.LastSeen) < 60*time.Second
+		if !online {
+			continue
+		}
+		list = append(list, map[string]any{
+			"id":             dev.ID,
+			"name":           dev.Name,
+			"address":        dev.Address,
+			"is_local":       dev.IsLocal,
+			"type":           dev.Type,
+			"format":         dev.Format,
+			"max_bitrate":    dev.MaxBitRate,
+			"navidrome_url":  dev.NavidromeURL,
+			"replaygain":     dev.ReplayGain,
+			"last_seen":      dev.LastSeen,
+			"online":         online,
+			"active":         dev.ID == a.activeDevice,
+		})
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (a *app) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeBody(w, r)
+	if !ok {
+		return
+	}
+	name := stringify(body["name"])
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	devType := stringify(body["type"])
+	if devType == "" {
+		devType = "agent"
+	}
+	address := stringify(body["address"])
+	if devType == "agent" && address == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "address is required"})
+		return
+	}
+	format := stringify(body["format"])
+	maxBitRate := intFromAny(body["max_bitrate"], 0)
+	navidromeURL := stringify(body["navidrome_url"])
+	replaygain := stringify(body["replaygain"])
+
+	id := name // use name as ID for simplicity
+
+	a.devicesMu.Lock()
+	// Close old channel if re-registering a browser device
+	if old, exists := a.devices[id]; exists && old.cmdCh != nil {
+		close(old.cmdCh)
+	}
+	dev := &device{
+		ID:           id,
+		Name:         name,
+		Address:      address,
+		IsLocal:      false,
+		Type:         devType,
+		Format:       format,
+		MaxBitRate:   maxBitRate,
+		NavidromeURL: navidromeURL,
+		ReplayGain:   replaygain,
+		LastSeen:     time.Now(),
+	}
+	if devType == "browser" {
+		dev.cmdCh = make(chan browserCmd, 32)
+		dev.browserState = map[string]any{}
+	}
+	a.devices[id] = dev
+	a.devicesMu.Unlock()
+
+	a.logger.Printf("device registered: %s (type=%s)", name, devType)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (a *app) handleDeviceHeartbeat(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeBody(w, r)
+	if !ok {
+		return
+	}
+	id := stringify(body["id"])
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
+		return
+	}
+
+	a.devicesMu.Lock()
+	dev, exists := a.devices[id]
+	if exists {
+		dev.LastSeen = time.Now()
+	}
+	a.devicesMu.Unlock()
+
+	if !exists {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "device not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *app) handleDeviceSetActive(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeBody(w, r)
+	if !ok {
+		return
+	}
+	newID := stringify(body["device_id"])
+	if newID == "" {
+		newID = stringify(body["id"])
+	}
+	if newID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "device_id is required"})
+		return
+	}
+
+	a.devicesMu.Lock()
+	newDev, exists := a.devices[newID]
+	if !exists {
+		a.devicesMu.Unlock()
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "device not found"})
+		return
+	}
+
+	oldID := a.activeDevice
+	if oldID == newID {
+		a.devicesMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]string{"message": "already active"})
+		return
+	}
+
+	// Build old target while holding devicesMu (to get the correct target)
+	var oldTarget playbackTarget
+	if oldID == "" || oldID == "local" {
+		oldTarget = a.mpv
+	} else if oldDev := a.devices[oldID]; oldDev != nil {
+		if oldDev.Type == "browser" {
+			oldTarget = &browserTarget{dev: oldDev}
+		} else {
+			oldTarget = &remoteTarget{address: oldDev.Address, client: &http.Client{Timeout: 5 * time.Second}}
+		}
+	} else {
+		oldTarget = a.mpv
+	}
+
+	// Build new target
+	var newTarget playbackTarget
+	if newDev.IsLocal {
+		newTarget = a.mpv
+	} else if newDev.Type == "browser" {
+		newTarget = &browserTarget{dev: newDev}
+	} else {
+		newTarget = &remoteTarget{address: newDev.Address, client: &http.Client{Timeout: 5 * time.Second}}
+	}
+
+	a.devicesMu.Unlock()
+
+	// Capture state from old target
+	var playlistPos int
+	var timePos float64
+	var wasPaused bool
+
+	if posRaw, err := oldTarget.getProperty("playlist-pos"); err == nil {
+		if f, ok := posRaw.(float64); ok {
+			playlistPos = int(f)
+		}
+	}
+	if tpRaw, err := oldTarget.getProperty("time-pos"); err == nil {
+		if f, ok := tpRaw.(float64); ok {
+			timePos = f
+		}
+	}
+	if pauseRaw, err := oldTarget.getProperty("pause"); err == nil {
+		if p, ok := pauseRaw.(bool); ok {
+			wasPaused = p
+		}
+	}
+
+	// Pause old target and clear its playlist
+	_ = oldTarget.setProperty("pause", true)
+	_ = oldTarget.playlistClear()
+
+	// Load playQueue into new target with device-specific stream URLs
+	a.playQueueMu.Lock()
+	queue := make([]string, len(a.playQueue))
+	copy(queue, a.playQueue)
+	a.playQueueMu.Unlock()
+
+	for i, songID := range queue {
+		loadMode := "append"
+		if i == 0 {
+			loadMode = "replace"
+		}
+		streamURL := a.streamURLForDevice(songID, newDev.Format, newDev.MaxBitRate, newDev.NavidromeURL)
+		if err := newTarget.loadFile(streamURL, loadMode, a.replayGainMeta(songID)); err != nil {
+			a.logger.Printf("device handoff: failed to load song %s: %v", songID, err)
+		}
+	}
+
+	// Set playlist position, seek, and resume — use atomic handoff where available
+	if len(queue) > 0 && playlistPos >= 0 && playlistPos < len(queue) {
+		switch {
+		case newDev.Type == "browser":
+			bt := &browserTarget{dev: newDev}
+			_ = bt.send(browserCmd{
+				Action: "handoff",
+				Data: map[string]any{
+					"playlist_pos": playlistPos,
+					"time_pos":     timePos,
+					"paused":       wasPaused,
+				},
+			})
+		case newDev.Type == "agent":
+			rt := newTarget.(*remoteTarget)
+			if err := rt.handoff(playlistPos, timePos, wasPaused); err != nil {
+				a.logger.Printf("device handoff: agent handoff failed: %v", err)
+			}
+		default: // local mpv
+			_ = newTarget.setProperty("playlist-pos", playlistPos)
+			// Wait for mpv to load the track
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				time.Sleep(50 * time.Millisecond)
+				if v, err := newTarget.getProperty("duration"); err == nil {
+					if d, ok := v.(float64); ok && d > 0 {
+						break
+					}
+				}
+			}
+			if timePos > 0 {
+				_ = newTarget.setProperty("time-pos", timePos)
+			}
+			if !wasPaused {
+				_ = newTarget.setProperty("pause", false)
+			}
+		}
+	} else if !wasPaused {
+		_ = newTarget.setProperty("pause", false)
+	}
+
+	// Update active device
+	a.devicesMu.Lock()
+	a.activeDevice = newID
+	a.devicesMu.Unlock()
+
+	a.logger.Printf("active device switched: %s -> %s", oldID, newID)
+	writeJSON(w, http.StatusOK, map[string]string{"message": "Device switched", "active_device": newID})
+}
+
+func (a *app) handleDeviceGetActive(w http.ResponseWriter, r *http.Request) {
+	dev := a.activeDeviceInfo()
+	if dev == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"id": "local", "name": "local", "is_local": true})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":          dev.ID,
+		"name":        dev.Name,
+		"address":     dev.Address,
+		"is_local":    dev.IsLocal,
+		"format":      dev.Format,
+		"max_bitrate": dev.MaxBitRate,
+	})
+}
+
+func (a *app) deviceCleanup() {
+	for {
+		time.Sleep(30 * time.Second)
+		a.devicesMu.RLock()
+		for id, dev := range a.devices {
+			if dev.IsLocal {
+				continue
+			}
+			if time.Since(dev.LastSeen) > 60*time.Second {
+				a.logger.Printf("device offline: %s (last seen %s)", id, dev.LastSeen.Format(time.RFC3339))
+			}
+		}
+		a.devicesMu.RUnlock()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Browser device SSE + status
+// ---------------------------------------------------------------------------
+
+func (a *app) handleDeviceSSE(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+
+	a.devicesMu.RLock()
+	dev, exists := a.devices[id]
+	a.devicesMu.RUnlock()
+
+	if !exists || dev.Type != "browser" {
+		http.Error(w, "device not found or not a browser device", http.StatusNotFound)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	flusher.Flush()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case cmd, ok := <-dev.cmdCh:
+			if !ok {
+				return
+			}
+			data, _ := json.Marshal(cmd)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+func (a *app) handleDeviceBrowserStatus(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeBody(w, r)
+	if !ok {
+		return
+	}
+	id := stringify(body["id"])
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
+		return
+	}
+
+	a.devicesMu.RLock()
+	dev, exists := a.devices[id]
+	a.devicesMu.RUnlock()
+
+	if !exists || dev.Type != "browser" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "device not found"})
+		return
+	}
+
+	dev.browserStateMu.Lock()
+	dev.browserState = map[string]any{
+		"pause":        body["pause"],
+		"time_pos":     body["time_pos"],
+		"duration":     body["duration"],
+		"playlist_pos": body["playlist_pos"],
+	}
+	dev.browserStateMu.Unlock()
+
+	// Also update last seen
+	a.devicesMu.Lock()
+	dev.LastSeen = time.Now()
+	a.devicesMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---------------------------------------------------------------------------
 // Scrobble loop
 // ---------------------------------------------------------------------------
 
@@ -1816,7 +2662,8 @@ func (a *app) scrobbleTick() {
 		return
 	}
 
-	pauseRaw, err := a.mpv.getProperty("pause")
+	t := a.target()
+	pauseRaw, err := t.getProperty("pause")
 	if err != nil {
 		return
 	}
@@ -1843,7 +2690,7 @@ func (a *app) scrobbleTick() {
 	}
 
 	elapsed := time.Since(a.scrobbleStartTime).Seconds()
-	durRaw, err := a.mpv.getProperty("duration")
+	durRaw, err := t.getProperty("duration")
 	if err != nil {
 		return
 	}
@@ -2024,6 +2871,12 @@ func (a *app) createCache() error {
 				"duration":    song.Duration,
 				"rating":      valueOrNil(""),
 				"id":          strconv.Itoa(trackIndex),
+				"replay_gain": map[string]any{
+					"track_gain": song.ReplayGain.TrackGain,
+					"album_gain": song.ReplayGain.AlbumGain,
+					"track_peak": song.ReplayGain.TrackPeak,
+					"album_peak": song.ReplayGain.AlbumPeak,
+				},
 			})
 			trackIndex++
 

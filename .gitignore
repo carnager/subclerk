@@ -4,3 +4,14 @@ bin/
 subclerkd/subclerkd
 cmd/*/subclerk*
 !cmd/*/main.go
+subclerkd-bin
+*.png
+
+# Android
+android/local.properties
+android/.gradle/
+android/.gobuild/
+android/.gomodcache/
+android/build/
+android/app/build/
+android/app/release/
