@@ -1,6 +1,6 @@
 # Maintainer: Rasmus Steinke <rasi at xssn dot at>
-pkgname=('subclerkd' 'subclerk-tui' 'subclerkc' 'subclerk-rofi' 'subclerk-musiclist')
-pkgver=0.1.0
+pkgname=('subclerkd' 'subclerk-agent' 'subclerk-tui' 'subclerkc' 'subclerk-rofi' 'subclerk-musiclist')
+pkgver=0.5.0
 pkgrel=1
 arch=('x86_64')
 url="https://github.com/carnager/subclerk"
@@ -25,6 +25,13 @@ package_subclerkd() {
                   "$pkgdir/usr/bin/subclerkd"
   install -Dm644 "$srcdir/subclerk/subclerkd/subclerkd.service" \
                   "$pkgdir/usr/lib/systemd/user/subclerkd.service"
+}
+
+package_subclerk-agent() {
+  pkgdesc="Remote playback agent for Subclerk"
+  depends=('mpv')
+  install -Dm755 "$srcdir/subclerk/bin/subclerk-agent" \
+                  "$pkgdir/usr/bin/subclerk-agent"
 }
 
 package_subclerk-tui() {
