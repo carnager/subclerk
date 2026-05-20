@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/subclerkd
+ExecStart=/usr/bin/subclerkd
 Restart=on-failure
 RestartSec=5
 
