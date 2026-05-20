@@ -11,8 +11,11 @@ sha256sums=('SKIP')
 
 build() {
   cd "$srcdir/subclerk"
-  GOSUMDB=off GOMODCACHE="$srcdir/subclerk/.gomodcache" GOCACHE="$srcdir/subclerk/.gobuild" \
-    ./build
+  export GOMODCACHE="$srcdir/gomodcache"
+  export GOCACHE="$srcdir/gobuild"
+  export GOSUMDB=off
+  ./build
+  chmod -R u+w "$srcdir/gomodcache" 2>/dev/null || true
 }
 
 package_subclerkd() {
