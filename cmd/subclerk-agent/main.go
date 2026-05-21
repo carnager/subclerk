@@ -285,7 +285,16 @@ func (a *agent) registerAndHeartbeat() {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// Register
+	for {
+		agentID := a.register(client)
+		a.heartbeatLoop(client, agentID)
+		// If heartbeatLoop returns, the server is gone — re-register
+		a.logger.Printf("lost connection to master, re-registering in 5s")
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func (a *agent) register(client *http.Client) string {
 	regBody, _ := json.Marshal(map[string]any{
 		"name":        a.cfg.Agent.Name,
 		"address":     a.cfg.Agent.Bind,
@@ -293,7 +302,6 @@ func (a *agent) registerAndHeartbeat() {
 		"max_bitrate": a.cfg.Agent.MaxBitRate,
 	})
 
-	var agentID string
 	for {
 		resp, err := client.Post(
 			"http://"+a.cfg.Agent.Master+"/api/v1/devices/register",
@@ -308,12 +316,14 @@ func (a *agent) registerAndHeartbeat() {
 		var result map[string]string
 		json.NewDecoder(resp.Body).Decode(&result)
 		resp.Body.Close()
-		agentID = result["id"]
+		agentID := result["id"]
 		a.logger.Printf("registered with master as %q (id=%s)", a.cfg.Agent.Name, agentID)
-		break
+		return agentID
 	}
+}
 
-	// Heartbeat every 10 seconds
+func (a *agent) heartbeatLoop(client *http.Client, agentID string) {
+	failures := 0
 	for {
 		time.Sleep(10 * time.Second)
 		hbBody, _ := json.Marshal(map[string]string{"id": agentID})
@@ -323,10 +333,20 @@ func (a *agent) registerAndHeartbeat() {
 			bytes.NewReader(hbBody),
 		)
 		if err != nil {
-			a.logger.Printf("heartbeat failed: %v", err)
+			failures++
+			a.logger.Printf("heartbeat failed (%d/3): %v", failures, err)
+			if failures >= 3 {
+				return // trigger re-registration
+			}
 			continue
 		}
 		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			// Server doesn't know us anymore (restarted) — re-register
+			a.logger.Printf("server lost our registration, re-registering")
+			return
+		}
+		failures = 0
 	}
 }
 

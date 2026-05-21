@@ -13,10 +13,12 @@ enum class LibView { Artists, Albums, Tracks }
 
 class MainViewModel : ViewModel() {
     private val api get() = SubclerkApp.instance.api
+    private val offline = SubclerkApp.instance.offlineManager
 
     // Playback status
     var status by mutableStateOf<PlaybackStatus?>(null); private set
     var queue by mutableStateOf<List<QueueItem>>(emptyList()); private set
+    var currentTrackOffline by mutableStateOf(false); private set
 
     // Library
     var libView by mutableStateOf(LibView.Artists); private set
@@ -38,9 +40,15 @@ class MainViewModel : ViewModel() {
     var showActionMenu by mutableStateOf(false)
     var actionTarget by mutableStateOf<ActionTarget?>(null); private set
 
+    // Offline downloads
+    var downloadProgress by mutableStateOf<OfflineManager.DownloadProgress?>(null); private set
+    var downloadedAlbums by mutableStateOf<Set<String>>(emptySet()); private set
+
     private var pollJob: Job? = null
+    private var downloadJob: Job? = null
 
     init {
+        downloadedAlbums = offline.getDownloadedAlbumIds()
         startPolling()
         loadArtists()
     }
@@ -58,6 +66,7 @@ class MainViewModel : ViewModel() {
     private suspend fun refresh() {
         status = api.getStatus()
         queue = api.getQueue()
+        currentTrackOffline = PlaybackService.instance?.isCurrentTrackOffline ?: false
     }
 
     // --- Library ---
@@ -185,6 +194,29 @@ class MainViewModel : ViewModel() {
     fun queueRemove(position: Int) { viewModelScope.launch { api.queueRemove(position) } }
     fun queueMove(from: Int, to: Int) { viewModelScope.launch { api.queueMove(from, to) } }
     fun queueClear() { viewModelScope.launch { api.queueClear() } }
+
+    // --- Offline downloads ---
+
+    fun downloadAlbum(album: Album) {
+        if (downloadJob?.isActive == true) return
+        downloadJob = viewModelScope.launch {
+            val albumTracks = api.getTracks(album.id)
+            if (albumTracks.isEmpty()) return@launch
+            val deviceId = PlaybackService.instance?.deviceId ?: ""
+            offline.downloadAlbum(album.id, albumTracks, api, deviceId) { progress ->
+                downloadProgress = progress
+            }
+            downloadProgress = null
+            downloadedAlbums = offline.getDownloadedAlbumIds()
+        }
+    }
+
+    fun removeOfflineAlbum(albumId: String) {
+        offline.removeAlbum(albumId)
+        downloadedAlbums = offline.getDownloadedAlbumIds()
+    }
+
+    fun isAlbumDownloaded(albumId: String): Boolean = offline.isAlbumDownloaded(albumId)
 
     // --- Devices ---
 

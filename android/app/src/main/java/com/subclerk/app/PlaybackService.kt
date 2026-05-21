@@ -26,12 +26,15 @@ class PlaybackService : MediaSessionService() {
     private var player: ExoPlayer? = null
     private var sseJob: Job? = null
     private var heartbeatJob: Job? = null
-    private var deviceId: String? = null
+    var deviceId: String? = null
+        private set
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // ReplayGain: gain values per playlist index
     private val replayGainMap = mutableMapOf<Int, Pair<Double, Double>>() // index -> (trackGain, albumGain)
+    // Track which playlist indices are playing from offline cache
+    private val offlineIndexes = mutableSetOf<Int>()
 
     override fun onCreate() {
         super.onCreate()
@@ -113,7 +116,8 @@ class PlaybackService : MediaSessionService() {
             val name = prefs.getString("device_name", null) ?: "android-${android.os.Build.MODEL}".replace(" ", "-").lowercase()
             val format = prefs.getString("audio_format", "") ?: ""
             val bitrate = prefs.getInt("audio_bitrate", 0)
-            val navidromeUrl = prefs.getString("navidrome_url", "") ?: ""
+            // Only pass navidrome_url when on external network
+            val navidromeUrl = if (SubclerkApp.instance.isOnHomeWifi()) "" else (prefs.getString("navidrome_url", "") ?: "")
             val replaygain = prefs.getString("replaygain", "off") ?: "off"
 
             val id = api.registerDevice(name, format, bitrate, navidromeUrl, replaygain)
@@ -156,6 +160,24 @@ class PlaybackService : MediaSessionService() {
             }
         }
     }
+
+    private fun scheduleStatusReport() {
+        val id = deviceId ?: return
+        // Delay slightly so ExoPlayer resolves duration
+        mainHandler.postDelayed({
+            val p = player ?: return@postDelayed
+            val paused = !p.isPlaying
+            val timePos = p.currentPosition / 1000.0
+            val duration = p.duration.let { if (it > 0) it / 1000.0 else 0.0 }
+            val playlistPos = p.currentMediaItemIndex
+            scope.launch {
+                SubclerkApp.instance.api.reportStatus(id, paused, timePos, duration, playlistPos)
+            }
+        }, 500)
+    }
+
+    val isCurrentTrackOffline: Boolean
+        get() = player?.let { offlineIndexes.contains(it.currentMediaItemIndex) } ?: false
 
     companion object {
         var instance: PlaybackService? = null
@@ -212,8 +234,13 @@ class PlaybackService : MediaSessionService() {
             "load" -> {
                 val url = data?.optString("url") ?: return
                 val mode = data.optString("mode", "replace")
-                android.util.Log.d("PlaybackService", "load: mode=$mode url=${url.take(80)}...")
-                val item = MediaItem.fromUri(url)
+                val songId = data.optString("song_id", "")
+                android.util.Log.d("PlaybackService", "load: mode=$mode songId=$songId url=${url.take(80)}...")
+                // Use offline file if available
+                val offline = SubclerkApp.instance.offlineManager
+                val localPath = if (songId.isNotBlank()) offline.getLocalPath(songId) else null
+                val mediaUri = localPath ?: url
+                val item = MediaItem.fromUri(mediaUri)
                 // Extract ReplayGain data
                 val rg = data.optJSONObject("replay_gain")
                 val trackGain = rg?.optDouble("track_gain", 0.0) ?: 0.0
@@ -221,26 +248,31 @@ class PlaybackService : MediaSessionService() {
                 when (mode) {
                     "replace" -> {
                         replayGainMap.clear()
+                        offlineIndexes.clear()
                         replayGainMap[0] = Pair(trackGain, albumGain)
+                        if (localPath != null) offlineIndexes.add(0)
                         p.setMediaItem(item)
                         p.prepare()
                         p.play()
                         applyReplayGain()
+                        scheduleStatusReport()
                     }
                     "append", "append-play" -> {
                         val idx = p.mediaItemCount
                         replayGainMap[idx] = Pair(trackGain, albumGain)
+                        if (localPath != null) offlineIndexes.add(idx)
                         p.addMediaItem(item)
                         if (p.mediaItemCount == 1 || mode == "append-play") {
                             p.seekTo(p.mediaItemCount - 1, 0)
                             p.prepare()
                             p.play()
                             applyReplayGain()
+                            scheduleStatusReport()
                         }
                     }
                 }
             }
-            "play" -> { p.prepare(); p.play() }
+            "play" -> { p.prepare(); p.play(); scheduleStatusReport() }
             "pause" -> p.pause()
             "stop" -> { p.pause(); p.seekTo(0) }
             "seek" -> {
@@ -255,6 +287,7 @@ class PlaybackService : MediaSessionService() {
             }
             "clear" -> {
                 replayGainMap.clear()
+                offlineIndexes.clear()
                 p.clearMediaItems()
                 p.stop()
             }
@@ -280,6 +313,7 @@ class PlaybackService : MediaSessionService() {
                     p.prepare()
                     if (!paused) p.play() else p.pause()
                 }
+                scheduleStatusReport()
             }
             "set-property" -> {
                 val name = data?.optString("name") ?: return

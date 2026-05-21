@@ -423,6 +423,9 @@ func (bt *browserTarget) loadFile(url, mode string, meta map[string]any) error {
 	if rg, ok := meta["replay_gain"]; ok && rg != nil {
 		data["replay_gain"] = rg
 	}
+	if songID, ok := meta["song_id"]; ok && songID != nil {
+		data["song_id"] = songID
+	}
 	return bt.send(browserCmd{Action: "load", Data: data})
 }
 
@@ -849,6 +852,9 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/devices/stream", a.handleDeviceSSE)
 	mux.HandleFunc("POST /api/v1/devices/status", a.handleDeviceBrowserStatus)
 
+	// Stream URL (for offline downloads)
+	mux.HandleFunc("GET /api/v1/stream/url", a.handleStreamURL)
+
 	// Scrobble toggle
 	mux.HandleFunc("GET /api/v1/scrobble/status", a.handleScrobbleStatus)
 	mux.HandleFunc("POST /api/v1/scrobble/toggle", a.handleScrobbleToggle)
@@ -1221,12 +1227,13 @@ func (a *app) streamURLForActiveDevice(songID string) string {
 // ---------------------------------------------------------------------------
 
 func (a *app) replayGainMeta(songID string) map[string]any {
+	meta := map[string]any{"song_id": songID}
 	if track := a.findTrackBySongID(songID); track != nil {
 		if rg, ok := track["replay_gain"].(map[string]any); ok {
-			return map[string]any{"replay_gain": rg}
+			meta["replay_gain"] = rg
 		}
 	}
-	return nil
+	return meta
 }
 
 func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
@@ -1799,6 +1806,18 @@ func (a *app) handlePlaybackStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	songID := a.currentPlayingSongID()
+	// If we can't get songID from the target (no status report yet), try queue position 0
+	if songID == "" {
+		a.playQueueMu.Lock()
+		if len(a.playQueue) > 0 {
+			pos := 0
+			if p, ok := status["playlist_pos"].(int); ok && p >= 0 && p < len(a.playQueue) {
+				pos = p
+			}
+			songID = a.playQueue[pos]
+		}
+		a.playQueueMu.Unlock()
+	}
 	if songID != "" {
 		status["song_id"] = songID
 		if track := a.findTrackBySongID(songID); track != nil {
@@ -1808,6 +1827,38 @@ func (a *app) handlePlaybackStatus(w http.ResponseWriter, r *http.Request) {
 			status["date"] = track["date"]
 			if rg, ok := track["replay_gain"].(map[string]any); ok {
 				status["replay_gain"] = rg
+			}
+			// Fall back to track metadata duration if device reports 0
+			// (happens with transcoded streams where ExoPlayer can't determine duration)
+			dur, _ := status["duration"].(float64)
+			if dur <= 0 {
+				rawDur := track["duration"]
+				switch d := rawDur.(type) {
+				case float64:
+					if d > 0 { status["duration"] = d }
+				case int:
+					if d > 0 { status["duration"] = float64(d) }
+				case int8:
+					if d > 0 { status["duration"] = float64(d) }
+				case int16:
+					if d > 0 { status["duration"] = float64(d) }
+				case int32:
+					if d > 0 { status["duration"] = float64(d) }
+				case int64:
+					if d > 0 { status["duration"] = float64(d) }
+				case uint:
+					if d > 0 { status["duration"] = float64(d) }
+				case uint8:
+					if d > 0 { status["duration"] = float64(d) }
+				case uint16:
+					if d > 0 { status["duration"] = float64(d) }
+				case uint32:
+					if d > 0 { status["duration"] = float64(d) }
+				case uint64:
+					if d > 0 { status["duration"] = float64(d) }
+				default:
+					a.logger.Printf("duration fallback: unknown type %T value=%v", rawDur, rawDur)
+				}
 			}
 		}
 	}
@@ -2253,6 +2304,32 @@ func matchesAll(text string, terms []string) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Handlers: Stream URL
+// ---------------------------------------------------------------------------
+
+func (a *app) handleStreamURL(w http.ResponseWriter, r *http.Request) {
+	songID := r.URL.Query().Get("song_id")
+	deviceID := r.URL.Query().Get("device_id")
+	if songID == "" {
+		http.Error(w, "song_id required", http.StatusBadRequest)
+		return
+	}
+	var streamURL string
+	if deviceID != "" {
+		a.devicesMu.RLock()
+		dev := a.devices[deviceID]
+		a.devicesMu.RUnlock()
+		if dev != nil {
+			streamURL = a.streamURLForDevice(songID, dev.Format, dev.MaxBitRate, dev.NavidromeURL)
+		} else {
+			streamURL = a.streamURL(songID)
+		}
+	} else {
+		streamURL = a.streamURL(songID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": streamURL})
+}
+
 // Handlers: Scrobble toggle
 // ---------------------------------------------------------------------------
 

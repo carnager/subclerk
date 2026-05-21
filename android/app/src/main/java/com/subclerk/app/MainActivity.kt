@@ -51,8 +51,11 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.LibraryMusic
@@ -113,10 +116,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Request notification permission on Android 13+
+        val permsToRequest = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                permsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+        // Location permission needed to read WiFi SSID for auto server switching
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            permsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (permsToRequest.isNotEmpty()) {
+            requestPermissions(permsToRequest.toTypedArray(), 1)
         }
         val serviceIntent = Intent(this, PlaybackService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -243,6 +254,28 @@ fun MainScreen(vm: MainViewModel) {
         Scaffold(
             bottomBar = {
                 Column {
+                    // Download progress
+                    val dlProgress = vm.downloadProgress
+                    if (dlProgress != null) {
+                        Surface(color = MaterialTheme.colorScheme.primaryContainer) {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
+                                Text(
+                                    "Downloading: ${dlProgress.trackTitle} (${dlProgress.current}/${dlProgress.total})",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(Modifier.height(4.dp))
+                                LinearProgressIndicator(
+                                    progress = { dlProgress.current.toFloat() / dlProgress.total },
+                                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                                    color = MaterialTheme.colorScheme.primary,
+                                    trackColor = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f)
+                                )
+                            }
+                        }
+                    }
                     MiniPlayerBar(vm) { showNowPlaying = true }
                     NavigationBar(
                         containerColor = MaterialTheme.colorScheme.surface,
@@ -366,13 +399,25 @@ fun MiniPlayerBar(vm: MainViewModel, onClick: () -> Unit) {
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(
-                        st.title.ifBlank { "\u2014" },
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            st.title.ifBlank { "\u2014" },
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        if (vm.currentTrackOffline) {
+                            Spacer(Modifier.width(4.dp))
+                            Icon(
+                                Icons.Default.DownloadDone,
+                                "Cached",
+                                modifier = Modifier.size(14.dp),
+                                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
                     if (st.artist.isNotBlank()) {
                         Text(
                             st.artist,
@@ -474,15 +519,29 @@ fun NowPlayingScreen(vm: MainViewModel, onDismiss: () -> Unit) {
             Spacer(Modifier.height(36.dp))
 
             // Track info
-            Text(
-                st?.title?.ifBlank { "\u2014" } ?: "Not Playing",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    st?.title?.ifBlank { "\u2014" } ?: "Not Playing",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center
+                )
+                if (vm.currentTrackOffline) {
+                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        Icons.Default.DownloadDone,
+                        "Cached",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+                    )
+                }
+            }
             Spacer(Modifier.height(6.dp))
             val sub = listOfNotNull(
                 st?.artist?.ifBlank { null },
@@ -685,9 +744,21 @@ fun AlbumList(vm: MainViewModel) {
             )
         }
         itemsIndexed(vm.albums) { _, album ->
+            val isOffline = vm.downloadedAlbums.contains(album.id)
             ListItem(
                 headlineContent = {
-                    Text(album.album, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(album.album, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                        if (isOffline) {
+                            Spacer(Modifier.width(6.dp))
+                            Icon(
+                                Icons.Default.DownloadDone,
+                                "Downloaded",
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
                 },
                 supportingContent = {
                     if (album.date.isNotBlank() && album.date != "0000") {
@@ -1059,7 +1130,9 @@ fun SettingsScreen(onDismiss: () -> Unit) {
         "subclerk", android.content.Context.MODE_PRIVATE
     )
     var server by remember { mutableStateOf(prefs.getString("server", "") ?: "") }
+    var externalServer by remember { mutableStateOf(prefs.getString("external_server", "") ?: "") }
     var navidromeUrl by remember { mutableStateOf(prefs.getString("navidrome_url", "") ?: "") }
+    var homeWifiSsid by remember { mutableStateOf(prefs.getString("home_wifi_ssid", "") ?: "") }
     var deviceName by remember {
         mutableStateOf(
             prefs.getString("device_name", null)
@@ -1071,15 +1144,18 @@ fun SettingsScreen(onDismiss: () -> Unit) {
     var replaygain by remember { mutableStateOf(prefs.getString("replaygain", "off") ?: "off") }
 
     fun saveAndReRegister() {
+        android.util.Log.d("Settings", "Saving: ssid='$homeWifiSsid' external='$externalServer'")
         prefs.edit()
             .putString("server", server)
+            .putString("external_server", externalServer)
             .putString("navidrome_url", navidromeUrl)
+            .putString("home_wifi_ssid", homeWifiSsid)
             .putString("device_name", deviceName)
             .putString("audio_format", format)
             .putInt("audio_bitrate", bitrate)
             .putString("replaygain", replaygain)
             .apply()
-        SubclerkApp.instance.updateServer(server)
+        SubclerkApp.instance.applyServerForCurrentNetwork()
     }
 
     Surface(
@@ -1121,7 +1197,7 @@ fun SettingsScreen(onDismiss: () -> Unit) {
                             OutlinedTextField(
                                 value = server,
                                 onValueChange = { server = it },
-                                label = { Text("Server address") },
+                                label = { Text("Local server address") },
                                 placeholder = { Text("192.168.1.10:6701") },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth(),
@@ -1129,14 +1205,48 @@ fun SettingsScreen(onDismiss: () -> Unit) {
                             )
                             Spacer(Modifier.height(12.dp))
                             OutlinedTextField(
+                                value = externalServer,
+                                onValueChange = { externalServer = it },
+                                label = { Text("External server address") },
+                                placeholder = { Text("subclerk.example.com:6701") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                                supportingText = {
+                                    Text("Used when not on home WiFi")
+                                },
+                                colors = OutlinedTextFieldDefaults.colors()
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            OutlinedTextField(
                                 value = navidromeUrl,
                                 onValueChange = { navidromeUrl = it },
-                                label = { Text("Navidrome URL (optional)") },
+                                label = { Text("External Navidrome URL") },
                                 placeholder = { Text("https://music.example.com") },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth(),
                                 supportingText = {
-                                    Text("External URL for mobile network access")
+                                    Text("Navidrome URL for streaming on external network")
+                                },
+                                colors = OutlinedTextFieldDefaults.colors()
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            val currentSsid = remember { SubclerkApp.instance.getCurrentSSID() }
+                            OutlinedTextField(
+                                value = homeWifiSsid,
+                                onValueChange = { homeWifiSsid = it },
+                                label = { Text("Home WiFi SSID") },
+                                placeholder = { Text(currentSsid ?: "MyHomeNetwork") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                                trailingIcon = {
+                                    if (currentSsid != null && currentSsid != homeWifiSsid) {
+                                        IconButton(onClick = { homeWifiSsid = currentSsid }) {
+                                            Icon(Icons.Default.Refresh, "Use current WiFi")
+                                        }
+                                    }
+                                },
+                                supportingText = {
+                                    Text(if (currentSsid != null) "Current: $currentSsid" else "Not on WiFi")
                                 },
                                 colors = OutlinedTextFieldDefaults.colors()
                             )
@@ -1321,6 +1431,35 @@ fun ActionSheet(vm: MainViewModel) {
                     leadingContent = { Icon(Icons.Default.FolderOpen, null) },
                     modifier = Modifier.clickable { vm.browseIntoAction() }
                 )
+            }
+
+            // Download option for albums
+            val albumForDownload = when (target) {
+                is MainViewModel.ActionTarget.AlbumTarget -> target.album
+                is MainViewModel.ActionTarget.SearchAlbumTarget -> target.album
+                else -> null
+            }
+            if (albumForDownload != null) {
+                val isDownloaded = vm.isAlbumDownloaded(albumForDownload.id)
+                if (isDownloaded) {
+                    ListItem(
+                        headlineContent = { Text("Remove download") },
+                        leadingContent = { Icon(Icons.Default.Delete, null) },
+                        modifier = Modifier.clickable {
+                            vm.removeOfflineAlbum(albumForDownload.id)
+                            vm.dismissAction()
+                        }
+                    )
+                } else {
+                    ListItem(
+                        headlineContent = { Text("Download for offline") },
+                        leadingContent = { Icon(Icons.Default.Download, null) },
+                        modifier = Modifier.clickable {
+                            vm.downloadAlbum(albumForDownload)
+                            vm.dismissAction()
+                        }
+                    )
+                }
             }
         }
     }

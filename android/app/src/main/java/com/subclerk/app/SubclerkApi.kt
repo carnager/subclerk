@@ -11,7 +11,7 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 data class Album(val id: String, val albumArtist: String, val album: String, val date: String)
-data class Track(val id: String, val title: String, val artist: String, val album: String, val trackNumber: Int)
+data class Track(val id: String, val songId: String, val title: String, val artist: String, val album: String, val trackNumber: Int)
 data class QueueItem(val position: Int, val songId: String, val title: String, val artist: String, val album: String, val duration: Double, val current: Boolean)
 data class PlaybackStatus(val state: String, val title: String, val artist: String, val album: String, val date: String, val timePos: Double, val duration: Double)
 data class DeviceInfo(val id: String, val name: String, val isLocal: Boolean, val type: String, val online: Boolean, val format: String, val maxBitrate: Int, val active: Boolean)
@@ -26,7 +26,11 @@ class SubclerkApi(private val server: String) {
     private val json = "application/json".toMediaType()
 
     val baseUrl: String
-        get() = if (server.isBlank()) "" else "http://$server/api/v1"
+        get() = if (server.isBlank()) "" else {
+            val scheme = if (server.startsWith("https://") || server.startsWith("http://")) "" else "http://"
+            val base = if (scheme.isNotEmpty()) "$scheme$server" else server
+            "$base/api/v1"
+        }
 
     val isConfigured: Boolean
         get() = server.isNotBlank()
@@ -85,6 +89,7 @@ class SubclerkApi(private val server: String) {
                 val o = arr.getJSONObject(i)
                 Track(
                     id = o.optString("id"),
+                    songId = o.optString("song_id", o.optString("id")),
                     title = o.optString("title"),
                     artist = o.optString("artist"),
                     album = o.optString("album"),
@@ -105,7 +110,7 @@ class SubclerkApi(private val server: String) {
                 val arr = obj.optJSONArray("tracks") ?: JSONArray()
                 (0 until arr.length()).map { i ->
                     val o = arr.getJSONObject(i)
-                    Track(o.optString("id"), o.optString("title"), o.optString("artist"), o.optString("album"), o.optInt("tracknumber", 0))
+                    Track(o.optString("id"), o.optString("song_id", o.optString("id")), o.optString("title"), o.optString("artist"), o.optString("album"), o.optInt("tracknumber", 0))
                 }
             } catch (e: Exception) { emptyList() }
             SearchResult(albums, tracks)
@@ -233,6 +238,15 @@ class SubclerkApi(private val server: String) {
 
     suspend fun rateTrack(value: String) { post("current_track/rating", """{"rating":"$value"}""") }
     suspend fun rateAlbum(value: String) { post("current_album/rating", """{"rating":"$value"}""") }
+
+    // --- Stream URL ---
+
+    suspend fun getStreamUrl(songId: String, deviceId: String = ""): String? {
+        val params = "song_id=${java.net.URLEncoder.encode(songId, "UTF-8")}" +
+            if (deviceId.isNotBlank()) "&device_id=${java.net.URLEncoder.encode(deviceId, "UTF-8")}" else ""
+        val data = get("stream/url?$params") ?: return null
+        return try { JSONObject(data).optString("url") } catch (e: Exception) { null }
+    }
 
     // --- Helpers ---
 
