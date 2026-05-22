@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 enum class LibView { Artists, Albums, Tracks }
+enum class LibSort { Artist, Recent }
 
 class MainViewModel : ViewModel() {
     private val api get() = SubclerkApp.instance.api
@@ -22,6 +23,7 @@ class MainViewModel : ViewModel() {
 
     // Library
     var libView by mutableStateOf(LibView.Artists); private set
+    var libSort by mutableStateOf(LibSort.Artist); private set
     var artists by mutableStateOf<List<String>>(emptyList()); private set
     var albums by mutableStateOf<List<Album>>(emptyList()); private set
     var tracks by mutableStateOf<List<Track>>(emptyList()); private set
@@ -35,6 +37,12 @@ class MainViewModel : ViewModel() {
 
     // Devices
     var devices by mutableStateOf<List<DeviceInfo>>(emptyList()); private set
+
+    // Playlists
+    var playlists by mutableStateOf<List<PlaylistInfo>>(emptyList()); private set
+    var playlistTracks by mutableStateOf<List<Track>>(emptyList()); private set
+    var curPlaylist by mutableStateOf<PlaylistInfo?>(null); private set
+    var playlistView by mutableStateOf(false); private set
 
     // Action menu
     var showActionMenu by mutableStateOf(false)
@@ -71,17 +79,38 @@ class MainViewModel : ViewModel() {
 
     // --- Library ---
 
+    // Cached latest albums for recent sort mode
+    private var latestAlbums: List<Album> = emptyList()
+
     fun loadArtists() {
         viewModelScope.launch {
-            artists = api.getArtists()
+            if (libSort == LibSort.Recent) {
+                latestAlbums = api.getLatestAlbums()
+                // Artists ordered by their most recent album
+                val seen = linkedSetOf<String>()
+                latestAlbums.forEach { seen.add(it.albumArtist) }
+                artists = seen.toList()
+            } else {
+                artists = api.getArtists()
+            }
             libView = LibView.Artists
         }
+    }
+
+    fun toggleLibSort() {
+        libSort = if (libSort == LibSort.Artist) LibSort.Recent else LibSort.Artist
+        loadArtists()
     }
 
     fun loadAlbums(artist: String) {
         viewModelScope.launch {
             curArtist = artist
-            albums = api.getAlbums(artist)
+            albums = if (libSort == LibSort.Recent) {
+                // Filter cached latest albums for this artist (already sorted by mtime)
+                latestAlbums.filter { it.albumArtist == artist }
+            } else {
+                api.getAlbums(artist)
+            }
             libView = LibView.Albums
         }
     }
@@ -116,6 +145,8 @@ class MainViewModel : ViewModel() {
         data class TrackTarget(val track: Track) : ActionTarget()
         data class SearchAlbumTarget(val album: Album) : ActionTarget()
         data class SearchTrackTarget(val track: Track) : ActionTarget()
+        data class QueueItemTarget(val item: QueueItem) : ActionTarget()
+        data class PlaylistTarget(val playlist: PlaylistInfo) : ActionTarget()
     }
 
     fun showAction(target: ActionTarget) {
@@ -133,7 +164,11 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             when (t) {
                 is ActionTarget.ArtistTarget -> {
-                    val artistAlbums = api.getAlbums(t.name)
+                    val artistAlbums = if (libSort == LibSort.Recent) {
+                        latestAlbums.filter { it.albumArtist == t.name }
+                    } else {
+                        api.getAlbums(t.name)
+                    }
                     if (artistAlbums.isNotEmpty()) {
                         api.addAlbums(artistAlbums.map { it.id }, mode)
                     }
@@ -142,6 +177,8 @@ class MainViewModel : ViewModel() {
                 is ActionTarget.TrackTarget -> api.addTrack(t.track.id, mode)
                 is ActionTarget.SearchAlbumTarget -> api.addAlbum(t.album.id, mode)
                 is ActionTarget.SearchTrackTarget -> api.addTrack(t.track.id, mode)
+                is ActionTarget.QueueItemTarget -> {} // handled separately in QueueScreen
+                is ActionTarget.PlaylistTarget -> api.addPlaylist(t.playlist.id, mode)
             }
         }
         dismissAction()
@@ -153,9 +190,18 @@ class MainViewModel : ViewModel() {
             is ActionTarget.ArtistTarget -> loadAlbums(t.name)
             is ActionTarget.AlbumTarget -> loadTracks(t.album)
             is ActionTarget.SearchAlbumTarget -> loadTracks(t.album)
+            is ActionTarget.QueueItemTarget -> {
+                if (t.item.albumId.isNotBlank()) {
+                    loadTracks(Album(t.item.albumId, t.item.artist, t.item.album, ""))
+                }
+            }
             else -> {}
         }
         dismissAction()
+    }
+
+    fun goToArtistFromQueue(item: QueueItem) {
+        loadAlbums(item.artist)
     }
 
     // --- Search ---
@@ -217,6 +263,57 @@ class MainViewModel : ViewModel() {
     }
 
     fun isAlbumDownloaded(albumId: String): Boolean = offline.isAlbumDownloaded(albumId)
+
+    // --- Add to playlist ---
+
+    var showPlaylistPicker by mutableStateOf(false); private set
+    var playlistPickerSongId by mutableStateOf(""); private set
+
+    fun showAddToPlaylist(songId: String) {
+        playlistPickerSongId = songId
+        viewModelScope.launch {
+            playlists = api.getPlaylists()
+            showPlaylistPicker = true
+        }
+    }
+
+    fun addToPlaylist(playlistId: String) {
+        val songId = playlistPickerSongId
+        if (songId.isBlank()) return
+        viewModelScope.launch {
+            api.addTrackToPlaylist(playlistId, songId)
+        }
+        showPlaylistPicker = false
+        playlistPickerSongId = ""
+    }
+
+    fun dismissPlaylistPicker() {
+        showPlaylistPicker = false
+        playlistPickerSongId = ""
+    }
+
+    // --- Playlists ---
+
+    fun loadPlaylists() {
+        viewModelScope.launch {
+            playlists = api.getPlaylists()
+            playlistView = false
+        }
+    }
+
+    fun loadPlaylistTracks(playlist: PlaylistInfo) {
+        viewModelScope.launch {
+            curPlaylist = playlist
+            playlistTracks = api.getPlaylistTracks(playlist.id)
+            playlistView = true
+        }
+    }
+
+    fun playlistBack() {
+        playlistView = false
+        playlistTracks = emptyList()
+        curPlaylist = null
+    }
 
     // --- Devices ---
 

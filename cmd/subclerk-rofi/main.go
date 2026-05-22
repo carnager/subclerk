@@ -24,6 +24,7 @@ const defaultLocalAPIAddress = shared.LocalAPIConfigValue
 type config struct {
 	API struct {
 		Address string `toml:"address"`
+		Secret  string `toml:"secret"`
 	} `toml:"api"`
 	Autostart struct {
 		Enabled        bool     `toml:"enabled"`
@@ -86,6 +87,7 @@ type cacheStatus struct {
 
 type apiClient struct {
 	baseURL              string
+	secret               string
 	autoStartLocalDaemon bool
 	useLocalSocket       bool
 	localServiceUnit     string
@@ -339,6 +341,7 @@ func newAPIClient(cfg config, baseURL string, autoStart bool, useLocalSocket boo
 	}
 	return &apiClient{
 		baseURL:              baseURL,
+		secret:               cfg.API.Secret,
 		autoStartLocalDaemon: autoStart && cfg.Autostart.Enabled,
 		useLocalSocket:       useLocalSocket,
 		localServiceUnit:     cfg.Autostart.SystemdUnit,
@@ -363,6 +366,9 @@ func (c *apiClient) ensureAvailable() error {
 
 func (c *apiClient) healthcheck() bool {
 	req, _ := http.NewRequest(http.MethodGet, c.baseURL+"/health", nil)
+	if c.secret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.secret)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return false
@@ -456,6 +462,9 @@ func (c *apiClient) ensureFreshCache() error {
 }
 
 func (c *apiClient) do(req *http.Request, out any, retryOnConnectError bool) error {
+	if c.secret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.secret)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if retryOnConnectError && c.autoStartLocalDaemon {

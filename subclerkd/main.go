@@ -36,6 +36,7 @@ import (
 type config struct {
 	Server struct {
 		BindToAddress []string `toml:"bind_to_address"`
+		APISecret     string   `toml:"api_secret"`
 	} `toml:"server"`
 	Navidrome struct {
 		URL      string `toml:"url"`
@@ -63,9 +64,10 @@ type paths struct {
 	ConfigPath       string
 	AlbumCacheFile   string
 	TracksCacheFile  string
-	LatestCacheFile  string
 	RatingsCacheFile string
 	CacheStateFile   string
+	ActiveDeviceFile string
+	PlayQueueFile    string
 }
 
 type cacheState struct {
@@ -94,6 +96,8 @@ type subsonicResponse struct {
 		Album     *subAlbumDetail `json:"album,omitempty"`
 		ScanStatus *subScanStatus `json:"scanStatus,omitempty"`
 		NowPlaying *subNowPlaying `json:"nowPlaying,omitempty"`
+		Playlists  *subPlaylists  `json:"playlists,omitempty"`
+		Playlist   *subPlaylistDetail `json:"playlist,omitempty"`
 	} `json:"subsonic-response"`
 }
 
@@ -154,6 +158,28 @@ type subScanStatus struct {
 	LastScan  string `json:"lastScan,omitempty"`
 }
 
+type subPlaylists struct {
+	Playlists []subPlaylist `json:"playlist"`
+}
+
+type subPlaylist struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	SongCount int    `json:"songCount"`
+	Duration  int    `json:"duration"`
+	Owner     string `json:"owner"`
+	Public    bool   `json:"public"`
+	Created   string `json:"created"`
+	Changed   string `json:"changed"`
+	CoverArt  string `json:"coverArt"`
+}
+
+type subPlaylistDetail struct {
+	ID     string    `json:"id"`
+	Name   string    `json:"name"`
+	Songs  []subSong `json:"entry"`
+}
+
 type subNowPlaying struct {
 	Entries []subSong `json:"entry"`
 }
@@ -200,12 +226,27 @@ type playbackTarget interface {
 // remoteTarget talks to a subclerk-agent over HTTP.
 type remoteTarget struct {
 	address string
+	secret  string
 	client  *http.Client
+}
+
+func (rt *remoteTarget) doRequest(method, path string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, "http://"+rt.address+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if rt.secret != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.secret)
+	}
+	return rt.client.Do(req)
 }
 
 func (rt *remoteTarget) loadFile(url, mode string, meta map[string]any) error {
 	body, _ := json.Marshal(map[string]string{"url": url, "mode": mode})
-	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/load", "application/json", strings.NewReader(string(body)))
+	resp, err := rt.doRequest("POST", "/agent/v1/load", strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -217,7 +258,7 @@ func (rt *remoteTarget) loadFile(url, mode string, meta map[string]any) error {
 }
 
 func (rt *remoteTarget) playlistClear() error {
-	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/playlist-clear", "application/json", nil)
+	resp, err := rt.doRequest("POST", "/agent/v1/playlist-clear", nil)
 	if err != nil {
 		return err
 	}
@@ -230,7 +271,7 @@ func (rt *remoteTarget) playlistClear() error {
 
 func (rt *remoteTarget) playlistRemove(index int) error {
 	body, _ := json.Marshal(map[string]int{"index": index})
-	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/playlist-remove", "application/json", strings.NewReader(string(body)))
+	resp, err := rt.doRequest("POST", "/agent/v1/playlist-remove", strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -243,7 +284,7 @@ func (rt *remoteTarget) playlistRemove(index int) error {
 
 func (rt *remoteTarget) playlistMove(from, to int) error {
 	body, _ := json.Marshal(map[string]int{"from": from, "to": to})
-	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/playlist-move", "application/json", strings.NewReader(string(body)))
+	resp, err := rt.doRequest("POST", "/agent/v1/playlist-move", strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -255,7 +296,7 @@ func (rt *remoteTarget) playlistMove(from, to int) error {
 }
 
 func (rt *remoteTarget) getProperty(name string) (any, error) {
-	resp, err := rt.client.Get("http://" + rt.address + "/agent/v1/status")
+	resp, err := rt.doRequest("GET", "/agent/v1/status", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +328,7 @@ func (rt *remoteTarget) setProperty(name string, value any) error {
 		if v, ok := value.(bool); ok && !v {
 			endpoint = "/agent/v1/play"
 		}
-		resp, err := rt.client.Post("http://"+rt.address+endpoint, "application/json", nil)
+		resp, err := rt.doRequest("POST", endpoint, nil)
 		if err != nil {
 			return err
 		}
@@ -299,7 +340,7 @@ func (rt *remoteTarget) setProperty(name string, value any) error {
 	}
 	if name == "time-pos" {
 		body, _ := json.Marshal(map[string]any{"position": value})
-		resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/seek", "application/json", strings.NewReader(string(body)))
+		resp, err := rt.doRequest("POST", "/agent/v1/seek", strings.NewReader(string(body)))
 		if err != nil {
 			return err
 		}
@@ -310,7 +351,7 @@ func (rt *remoteTarget) setProperty(name string, value any) error {
 		return nil
 	}
 	body, _ := json.Marshal(map[string]any{"name": name, "value": value})
-	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/set-property", "application/json", strings.NewReader(string(body)))
+	resp, err := rt.doRequest("POST", "/agent/v1/set-property", strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -328,14 +369,14 @@ func (rt *remoteTarget) command(args ...any) (*mpvResponse, error) {
 	cmd := fmt.Sprintf("%v", args[0])
 	switch cmd {
 	case "playlist-next":
-		resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/next", "application/json", nil)
+		resp, err := rt.doRequest("POST", "/agent/v1/next", nil)
 		if err != nil {
 			return nil, err
 		}
 		resp.Body.Close()
 		return &mpvResponse{}, nil
 	case "playlist-prev":
-		resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/prev", "application/json", nil)
+		resp, err := rt.doRequest("POST", "/agent/v1/prev", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -366,7 +407,7 @@ func (rt *remoteTarget) handoff(playlistPos int, timePos float64, paused bool) e
 		"time_pos":     timePos,
 		"paused":       paused,
 	})
-	resp, err := rt.client.Post("http://"+rt.address+"/agent/v1/handoff", "application/json", strings.NewReader(string(body)))
+	resp, err := rt.doRequest("POST", "/agent/v1/handoff", strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -378,7 +419,7 @@ func (rt *remoteTarget) handoff(playlistPos int, timePos float64, paused bool) e
 }
 
 func (rt *remoteTarget) isRunning() bool {
-	resp, err := rt.client.Get("http://" + rt.address + "/agent/v1/health")
+	resp, err := rt.doRequest("GET", "/agent/v1/health", nil)
 	if err != nil {
 		return false
 	}
@@ -572,6 +613,7 @@ func main() {
 	if err := a.ensureStartupState(); err != nil {
 		logger.Fatalf("startup failed: %v", err)
 	}
+	a.restorePlayQueue()
 
 	go a.ensureMPV()
 	go a.watchNavidromeUpdates()
@@ -602,9 +644,10 @@ func loadConfig() (config, paths, error) {
 		ConfigPath:       filepath.Join(xdgConfig, "subclerk", "subclerkd.toml"),
 		AlbumCacheFile:   filepath.Join(xdgData, "subclerk", "album.cache"),
 		TracksCacheFile:  filepath.Join(xdgData, "subclerk", "tracks.cache"),
-		LatestCacheFile:  filepath.Join(xdgData, "subclerk", "latest.cache"),
 		RatingsCacheFile: filepath.Join(xdgData, "subclerk", "ratings.cache"),
 		CacheStateFile:   filepath.Join(xdgData, "subclerk", "cache.state"),
+		ActiveDeviceFile: filepath.Join(xdgData, "subclerk", "active_device"),
+		PlayQueueFile:    filepath.Join(xdgData, "subclerk", "playqueue.json"),
 	}
 
 	if err := os.MkdirAll(pathCfg.DataDir, 0o755); err != nil {
@@ -631,6 +674,7 @@ func loadConfig() (config, paths, error) {
 	random, _ := raw["random"].(map[string]any)
 	cache, _ := raw["cache"].(map[string]any)
 	cfg.Server.BindToAddress = stringSlice(server["bind_to_address"])
+	cfg.Server.APISecret = stringify(server["api_secret"])
 	cfg.Navidrome.URL = stringify(navidrome["url"])
 	cfg.Navidrome.Username = stringify(navidrome["username"])
 	cfg.Navidrome.Password = stringify(navidrome["password"])
@@ -800,9 +844,28 @@ func defaultBindToAddress() []string {
 // Routes
 // ---------------------------------------------------------------------------
 
+func (a *app) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip auth for unix socket connections (already secured by filesystem permissions)
+		isUnix := !strings.Contains(r.RemoteAddr, ":")
+		if a.cfg.Server.APISecret != "" && strings.HasPrefix(r.URL.Path, "/api/") && !isUnix {
+			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if token == "" {
+				token = r.URL.Query().Get("secret")
+			}
+			if token != a.cfg.Server.APISecret {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /api/v1/cover/{id}", a.handleCoverArt)
 	mux.HandleFunc("GET /api/v1/health", a.handleHealth)
 	mux.HandleFunc("GET /api/v1/albums", a.handleAlbums)
 	mux.HandleFunc("GET /api/v1/latest_albums", a.handleLatestAlbums)
@@ -843,6 +906,12 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/browse/tracks", a.handleBrowseTracks)
 	mux.HandleFunc("GET /api/v1/search", a.handleSearch)
 
+	// Navidrome playlists
+	mux.HandleFunc("GET /api/v1/playlists", a.handlePlaylists)
+	mux.HandleFunc("GET /api/v1/playlists/tracks", a.handlePlaylistTracks)
+	mux.HandleFunc("POST /api/v1/playlists/add/{id}", a.handlePlaylistAdd)
+	mux.HandleFunc("POST /api/v1/playlists/add-track/{id}", a.handlePlaylistAddTrack)
+
 	// Device management
 	mux.HandleFunc("GET /api/v1/devices", a.handleDevicesList)
 	mux.HandleFunc("POST /api/v1/devices/register", a.handleDeviceRegister)
@@ -863,7 +932,7 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("GET /ui", a.handleWebUI)
 	mux.HandleFunc("GET /ui/", a.handleWebUI)
 
-	return mux
+	return a.authMiddleware(mux)
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +956,7 @@ func (a *app) ensureStartupState() error {
 }
 
 func (a *app) allCachesExist() bool {
-	required := []string{a.paths.AlbumCacheFile, a.paths.TracksCacheFile, a.paths.LatestCacheFile, a.paths.RatingsCacheFile}
+	required := []string{a.paths.AlbumCacheFile, a.paths.TracksCacheFile, a.paths.RatingsCacheFile}
 	for _, path := range required {
 		if _, err := os.Stat(path); err != nil {
 			return false
@@ -1175,7 +1244,7 @@ func (a *app) target() playbackTarget {
 	if dev.Type == "browser" {
 		return &browserTarget{dev: dev}
 	}
-	return &remoteTarget{address: dev.Address, client: &http.Client{Timeout: 5 * time.Second}}
+	return &remoteTarget{address: dev.Address, secret: a.cfg.Server.APISecret, client: &http.Client{Timeout: 5 * time.Second}}
 }
 
 func (a *app) activeDeviceInfo() *device {
@@ -1261,6 +1330,7 @@ func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
 			}
 			a.playQueue = append(a.playQueue, id)
 		}
+		a.savePlayQueue()
 		return t.setProperty("pause", false)
 
 	case "insert":
@@ -1288,6 +1358,7 @@ func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
 			newQueue = append(newQueue, a.playQueue[pos:]...)
 		}
 		a.playQueue = newQueue
+		a.savePlayQueue()
 		return t.setProperty("pause", false)
 
 	default: // "add"
@@ -1297,8 +1368,70 @@ func (a *app) addSongsToPlaylist(songIDs []string, mode string) error {
 			}
 			a.playQueue = append(a.playQueue, id)
 		}
+		a.savePlayQueue()
 		return nil
 	}
+}
+
+// savePlayQueue persists the current play queue to disk (caller must hold playQueueMu or be safe).
+func (a *app) savePlayQueue() {
+	data, _ := json.Marshal(a.playQueue)
+	_ = os.WriteFile(a.paths.PlayQueueFile, data, 0o644)
+}
+
+// restorePlayQueue loads the saved play queue from disk and reloads into
+// the local mpv target so that clients see a consistent queue on reconnect.
+func (a *app) restorePlayQueue() {
+	data, err := os.ReadFile(a.paths.PlayQueueFile)
+	if err != nil {
+		return
+	}
+	var queue []string
+	if json.Unmarshal(data, &queue) != nil || len(queue) == 0 {
+		return
+	}
+	a.playQueue = queue
+	a.logger.Printf("restored play queue: %d tracks", len(queue))
+
+	// For local target, reload into mpv (paused) so clients can browse/click
+	if a.activeDevice == "" || a.activeDevice == "local" {
+		go a.reloadQueueIntoTarget()
+	}
+}
+
+// reloadQueueIntoTarget loads the saved playQueue into the current target (paused).
+func (a *app) reloadQueueIntoTarget() {
+	// Wait for mpv to be ready
+	for i := 0; i < 20; i++ {
+		if a.mpv.isRunning() {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !a.mpv.isRunning() {
+		a.logger.Printf("restore: mpv not ready, skipping queue reload")
+		return
+	}
+
+	a.playQueueMu.Lock()
+	queue := make([]string, len(a.playQueue))
+	copy(queue, a.playQueue)
+	a.playQueueMu.Unlock()
+
+	t := a.target()
+	for i, songID := range queue {
+		mode := "append"
+		if i == 0 {
+			mode = "replace"
+		}
+		if err := t.loadFile(a.streamURLForActiveDevice(songID), mode, a.replayGainMeta(songID)); err != nil {
+			a.logger.Printf("restore: failed to load track %d: %v", i, err)
+			return
+		}
+	}
+	// Pause immediately — we're just restoring state, not starting playback
+	_ = t.setProperty("pause", true)
+	a.logger.Printf("restored %d tracks into mpv (paused)", len(queue))
 }
 
 func (a *app) currentPlayingSongID() string {
@@ -1364,11 +1497,161 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *app) handleCoverArt(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	size := r.URL.Query().Get("size")
+	params := url.Values{"id": {id}}
+	if size != "" {
+		params.Set("size", size)
+	}
+	apiURL := a.subsonicURL("getCoverArt", params)
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "upstream error", resp.StatusCode)
+		return
+	}
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	io.Copy(w, resp.Body)
+}
+
+func (a *app) handlePlaylists(w http.ResponseWriter, r *http.Request) {
+	resp, err := a.subsonicGet("getPlaylists", nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if resp.SubsonicResponse.Playlists == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	result := make([]map[string]any, 0, len(resp.SubsonicResponse.Playlists.Playlists))
+	for _, pl := range resp.SubsonicResponse.Playlists.Playlists {
+		result = append(result, map[string]any{
+			"id":         pl.ID,
+			"name":       pl.Name,
+			"song_count": pl.SongCount,
+			"duration":   pl.Duration,
+			"cover_art":  pl.CoverArt,
+		})
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *app) handlePlaylistTracks(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
+		return
+	}
+	resp, err := a.subsonicGet("getPlaylist", url.Values{"id": {id}})
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if resp.SubsonicResponse.Playlist == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	tracks := make([]map[string]any, 0, len(resp.SubsonicResponse.Playlist.Songs))
+	for i, song := range resp.SubsonicResponse.Playlist.Songs {
+		tracks = append(tracks, map[string]any{
+			"id":                 strconv.Itoa(i),
+			"song_id":            song.ID,
+			"title":              song.Title,
+			"artist":             song.Artist,
+			"album":              song.Album,
+			"tracknumber":        song.Track,
+			"navidrome_album_id": song.AlbumID,
+			"duration":           song.Duration,
+		})
+	}
+	writeJSON(w, http.StatusOK, tracks)
+}
+
+func (a *app) handlePlaylistAdd(w http.ResponseWriter, r *http.Request) {
+	playlistID := r.PathValue("id")
+	if playlistID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
+		return
+	}
+	body, ok := decodeBody(w, r)
+	if !ok {
+		return
+	}
+	mode := stringify(body["mode"])
+	if mode == "" {
+		mode = "add"
+	}
+
+	// Fetch playlist tracks from Navidrome
+	resp, err := a.subsonicGet("getPlaylist", url.Values{"id": {playlistID}})
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if resp.SubsonicResponse.Playlist == nil || len(resp.SubsonicResponse.Playlist.Songs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "empty playlist"})
+		return
+	}
+
+	songIDs := make([]string, 0, len(resp.SubsonicResponse.Playlist.Songs))
+	for _, song := range resp.SubsonicResponse.Playlist.Songs {
+		songIDs = append(songIDs, song.ID)
+	}
+
+	if err := a.addSongsToPlaylist(songIDs, mode); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *app) handlePlaylistAddTrack(w http.ResponseWriter, r *http.Request) {
+	playlistID := r.PathValue("id")
+	if playlistID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
+		return
+	}
+	body, ok := decodeBody(w, r)
+	if !ok {
+		return
+	}
+	songID := stringify(body["song_id"])
+	if songID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "song_id required"})
+		return
+	}
+	_, err := a.subsonicGet("updatePlaylist", url.Values{
+		"playlistId":  {playlistID},
+		"songIdToAdd": {songID},
+	})
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (a *app) handleAlbums(w http.ResponseWriter, r *http.Request) {
 	albums, err := a.readMapSlice(a.paths.AlbumCacheFile)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	if r.URL.Query().Get("sort") == "latest" {
+		slices.SortFunc(albums, func(a1, a2 map[string]any) int {
+			return strings.Compare(stringify(a2["last_modified"]), stringify(a1["last_modified"]))
+		})
 	}
 	ratings, err := a.loadRatings()
 	if err != nil {
@@ -1380,18 +1663,8 @@ func (a *app) handleAlbums(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleLatestAlbums(w http.ResponseWriter, r *http.Request) {
-	albums, err := a.readMapSlice(a.paths.LatestCacheFile)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	ratings, err := a.loadRatings()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	a.applyCacheStateHeaders(w)
-	writeJSON(w, http.StatusOK, attachAlbumRatings(albums, ratings))
+	r.URL.RawQuery = "sort=latest"
+	a.handleAlbums(w, r)
 }
 
 func (a *app) handleTracks(w http.ResponseWriter, r *http.Request) {
@@ -1431,12 +1704,7 @@ func (a *app) handleCacheUpdate(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (a *app) handleAlbumRatingGet(w http.ResponseWriter, r *http.Request) {
-	cachePath, err := a.albumCachePath(strings.TrimSpace(r.URL.Query().Get("list_mode")))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	albums, err := a.readMapSlice(cachePath)
+	albums, err := a.readMapSlice(a.paths.AlbumCacheFile)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1470,16 +1738,7 @@ func (a *app) handleAlbumRatingPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid rating"})
 		return
 	}
-	listMode := stringify(body["list_mode"])
-	if listMode == "" {
-		listMode = strings.TrimSpace(r.URL.Query().Get("list_mode"))
-	}
-	cachePath, err := a.albumCachePath(listMode)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	albums, err := a.readMapSlice(cachePath)
+	albums, err := a.readMapSlice(a.paths.AlbumCacheFile)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1542,16 +1801,7 @@ func (a *app) handleAddAlbum(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := normalizePlaylistMode(stringify(body["mode"]))
-	listMode := stringify(body["list_mode"])
-	if listMode == "" {
-		listMode = "album"
-	}
-	cachePath, err := a.albumCachePath(listMode)
-	if err != nil {
-		a.writeError(w, r, http.StatusBadRequest, err.Error())
-		return
-	}
-	albums, err := a.readMapSlice(cachePath)
+	albums, err := a.readMapSlice(a.paths.AlbumCacheFile)
 	if err != nil {
 		a.writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
@@ -1612,16 +1862,7 @@ func (a *app) handleAddAlbums(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := normalizePlaylistMode(stringify(body["mode"]))
-	listMode := stringify(body["list_mode"])
-	if listMode == "" {
-		listMode = "album"
-	}
-	cachePath, err := a.albumCachePath(listMode)
-	if err != nil {
-		a.writeError(w, r, http.StatusBadRequest, err.Error())
-		return
-	}
-	albums, err := a.readMapSlice(cachePath)
+	albums, err := a.readMapSlice(a.paths.AlbumCacheFile)
 	if err != nil {
 		a.writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
@@ -1825,6 +2066,9 @@ func (a *app) handlePlaybackStatus(w http.ResponseWriter, r *http.Request) {
 			status["artist"] = track["artist"]
 			status["album"] = track["album"]
 			status["date"] = track["date"]
+			if albumID, ok := track["navidrome_album_id"].(string); ok && albumID != "" {
+				status["album_id"] = albumID
+			}
 			if rg, ok := track["replay_gain"].(map[string]any); ok {
 				status["replay_gain"] = rg
 			}
@@ -1900,6 +2144,9 @@ func (a *app) handleQueueGet(w http.ResponseWriter, r *http.Request) {
 			entry["album"] = track["album"]
 			entry["date"] = track["date"]
 			entry["duration"] = track["duration"]
+			if albumID, ok := track["navidrome_album_id"].(string); ok && albumID != "" {
+				entry["album_id"] = albumID
+			}
 		}
 		entries = append(entries, entry)
 	}
@@ -1925,6 +2172,7 @@ func (a *app) handleQueueRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.playQueue = append(a.playQueue[:pos], a.playQueue[pos+1:]...)
+	a.savePlayQueue()
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Removed from queue"})
 }
 
@@ -2118,6 +2366,7 @@ func (a *app) handleQueueMove(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.playQueue = newQueue
+	a.savePlayQueue()
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Moved"})
 }
 
@@ -2150,6 +2399,7 @@ func (a *app) handleQueueClear(w http.ResponseWriter, r *http.Request) {
 	_ = t.playlistClear()
 	a.playQueueMu.Lock()
 	a.playQueue = nil
+	a.savePlayQueue()
 	a.playQueueMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Queue cleared"})
 }
@@ -2425,6 +2675,11 @@ func (a *app) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 		dev.browserState = map[string]any{}
 	}
 	a.devices[id] = dev
+	// Restore saved active device on re-registration
+	if saved, err := os.ReadFile(a.paths.ActiveDeviceFile); err == nil && string(saved) == id {
+		a.activeDevice = id
+		a.logger.Printf("restored active device: %s", id)
+	}
 	a.devicesMu.Unlock()
 
 	a.logger.Printf("device registered: %s (type=%s)", name, devType)
@@ -2493,7 +2748,7 @@ func (a *app) handleDeviceSetActive(w http.ResponseWriter, r *http.Request) {
 		if oldDev.Type == "browser" {
 			oldTarget = &browserTarget{dev: oldDev}
 		} else {
-			oldTarget = &remoteTarget{address: oldDev.Address, client: &http.Client{Timeout: 5 * time.Second}}
+			oldTarget = &remoteTarget{address: oldDev.Address, secret: a.cfg.Server.APISecret, client: &http.Client{Timeout: 5 * time.Second}}
 		}
 	} else {
 		oldTarget = a.mpv
@@ -2506,7 +2761,7 @@ func (a *app) handleDeviceSetActive(w http.ResponseWriter, r *http.Request) {
 	} else if newDev.Type == "browser" {
 		newTarget = &browserTarget{dev: newDev}
 	} else {
-		newTarget = &remoteTarget{address: newDev.Address, client: &http.Client{Timeout: 5 * time.Second}}
+		newTarget = &remoteTarget{address: newDev.Address, secret: a.cfg.Server.APISecret, client: &http.Client{Timeout: 5 * time.Second}}
 	}
 
 	a.devicesMu.Unlock()
@@ -2542,14 +2797,41 @@ func (a *app) handleDeviceSetActive(w http.ResponseWriter, r *http.Request) {
 	copy(queue, a.playQueue)
 	a.playQueueMu.Unlock()
 
-	for i, songID := range queue {
-		loadMode := "append"
-		if i == 0 {
-			loadMode = "replace"
+	if newDev.Type == "browser" {
+		// Send entire queue + position in a single handoff command
+		bt := &browserTarget{dev: newDev}
+		tracks := make([]map[string]any, 0, len(queue))
+		for _, songID := range queue {
+			track := map[string]any{
+				"url":     a.streamURLForDevice(songID, newDev.Format, newDev.MaxBitRate, newDev.NavidromeURL),
+				"song_id": songID,
+			}
+			if meta := a.replayGainMeta(songID); meta != nil {
+				if rgVal, ok := meta["replay_gain"]; ok {
+					track["replay_gain"] = rgVal
+				}
+			}
+			tracks = append(tracks, track)
 		}
-		streamURL := a.streamURLForDevice(songID, newDev.Format, newDev.MaxBitRate, newDev.NavidromeURL)
-		if err := newTarget.loadFile(streamURL, loadMode, a.replayGainMeta(songID)); err != nil {
-			a.logger.Printf("device handoff: failed to load song %s: %v", songID, err)
+		_ = bt.send(browserCmd{
+			Action: "handoff",
+			Data: map[string]any{
+				"tracks":       tracks,
+				"playlist_pos": playlistPos,
+				"time_pos":     timePos,
+				"paused":       wasPaused,
+			},
+		})
+	} else {
+		for i, songID := range queue {
+			loadMode := "append"
+			if i == 0 {
+				loadMode = "replace"
+			}
+			streamURL := a.streamURLForDevice(songID, newDev.Format, newDev.MaxBitRate, newDev.NavidromeURL)
+			if err := newTarget.loadFile(streamURL, loadMode, a.replayGainMeta(songID)); err != nil {
+				a.logger.Printf("device handoff: failed to load song %s: %v", songID, err)
+			}
 		}
 	}
 
@@ -2557,15 +2839,7 @@ func (a *app) handleDeviceSetActive(w http.ResponseWriter, r *http.Request) {
 	if len(queue) > 0 && playlistPos >= 0 && playlistPos < len(queue) {
 		switch {
 		case newDev.Type == "browser":
-			bt := &browserTarget{dev: newDev}
-			_ = bt.send(browserCmd{
-				Action: "handoff",
-				Data: map[string]any{
-					"playlist_pos": playlistPos,
-					"time_pos":     timePos,
-					"paused":       wasPaused,
-				},
-			})
+			// handled above in single handoff command
 		case newDev.Type == "agent":
 			rt := newTarget.(*remoteTarget)
 			if err := rt.handoff(playlistPos, timePos, wasPaused); err != nil {
@@ -2598,6 +2872,7 @@ func (a *app) handleDeviceSetActive(w http.ResponseWriter, r *http.Request) {
 	a.devicesMu.Lock()
 	a.activeDevice = newID
 	a.devicesMu.Unlock()
+	_ = os.WriteFile(a.paths.ActiveDeviceFile, []byte(newID), 0o644)
 
 	a.logger.Printf("active device switched: %s -> %s", oldID, newID)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Device switched", "active_device": newID})
@@ -2909,7 +3184,6 @@ func (a *app) createCache() error {
 
 	albums := make([]map[string]any, 0, len(allSubAlbums))
 	tracks := make([]map[string]any, 0)
-	latestMap := map[string]map[string]any{}
 	trackIndex := 0
 
 	for i, res := range results {
@@ -2921,33 +3195,36 @@ func (a *app) createCache() error {
 			date = strconv.Itoa(subAlbum.Year)
 		}
 
-		key := albumArtist + "|||" + albumName + "|||" + date
-
-		albums = append(albums, map[string]any{
+		albumEntry := map[string]any{
+			"id":                 subAlbum.ID,
 			"albumartist":        albumArtist,
 			"album":              albumName,
 			"date":               date,
 			"navidrome_album_id": subAlbum.ID,
-		})
+		}
+		albumIdx := len(albums)
+		albums = append(albums, albumEntry)
 
 		if res.detail == nil {
 			continue
 		}
 
+		var maxCreated string
 		for _, song := range res.detail.Songs {
 			tracks = append(tracks, map[string]any{
-				"track":       strconv.Itoa(song.Track),
-				"tracknumber": song.Track,
-				"discnumber":  song.DiscNumber,
-				"title":       song.Title,
-				"artist":      song.Artist,
-				"albumartist": albumArtist,
-				"album":       albumName,
-				"date":        date,
-				"song_id":     song.ID,
-				"duration":    song.Duration,
-				"rating":      valueOrNil(""),
-				"id":          strconv.Itoa(trackIndex),
+				"track":              strconv.Itoa(song.Track),
+				"tracknumber":        song.Track,
+				"discnumber":         song.DiscNumber,
+				"title":              song.Title,
+				"artist":             song.Artist,
+				"albumartist":        albumArtist,
+				"album":              albumName,
+				"date":               date,
+				"song_id":            song.ID,
+				"duration":           song.Duration,
+				"rating":             valueOrNil(""),
+				"id":                 strconv.Itoa(trackIndex),
+				"navidrome_album_id": subAlbum.ID,
 				"replay_gain": map[string]any{
 					"track_gain": song.ReplayGain.TrackGain,
 					"album_gain": song.ReplayGain.AlbumGain,
@@ -2956,17 +3233,12 @@ func (a *app) createCache() error {
 				},
 			})
 			trackIndex++
-
-			prev := latestMap[key]
-			if prev == nil || strings.Compare(song.Created, stringify(prev["last-modified"])) > 0 {
-				latestMap[key] = map[string]any{
-					"albumartist":        albumArtist,
-					"album":              albumName,
-					"date":               date,
-					"last-modified":      song.Created,
-					"navidrome_album_id": subAlbum.ID,
-				}
+			if song.Created > maxCreated {
+				maxCreated = song.Created
 			}
+		}
+		if maxCreated != "" {
+			albums[albumIdx]["last_modified"] = maxCreated
 		}
 
 		if (i+1)%100 == 0 {
@@ -2974,7 +3246,7 @@ func (a *app) createCache() error {
 		}
 	}
 
-	// Sort albums
+	// Sort albums alphabetically by default
 	slices.SortFunc(albums, func(a1, a2 map[string]any) int {
 		if c := strings.Compare(strings.ToLower(stringify(a1["albumartist"])), strings.ToLower(stringify(a2["albumartist"]))); c != 0 {
 			return c
@@ -2984,29 +3256,11 @@ func (a *app) createCache() error {
 		}
 		return strings.Compare(strings.ToLower(stringify(a1["album"])), strings.ToLower(stringify(a2["album"])))
 	})
-	for i := range albums {
-		albums[i]["id"] = strconv.Itoa(i)
-	}
-
-	// Build latest list
-	latest := make([]map[string]any, 0, len(latestMap))
-	for _, album := range latestMap {
-		latest = append(latest, album)
-	}
-	slices.SortFunc(latest, func(a1, a2 map[string]any) int {
-		return strings.Compare(stringify(a2["last-modified"]), stringify(a1["last-modified"]))
-	})
-	for i := range latest {
-		latest[i]["id"] = strconv.Itoa(i)
-	}
 
 	if err := a.writeMapSlice(a.paths.AlbumCacheFile, albums); err != nil {
 		return err
 	}
 	if err := a.writeMapSlice(a.paths.TracksCacheFile, tracks); err != nil {
-		return err
-	}
-	if err := a.writeMapSlice(a.paths.LatestCacheFile, latest); err != nil {
 		return err
 	}
 	return nil
@@ -3137,7 +3391,7 @@ func newCacheState(updatedAt time.Time) cacheState {
 }
 
 func (a *app) deriveCacheState() (cacheState, error) {
-	paths := []string{a.paths.AlbumCacheFile, a.paths.TracksCacheFile, a.paths.LatestCacheFile}
+	paths := []string{a.paths.AlbumCacheFile, a.paths.TracksCacheFile}
 	var newest time.Time
 	for _, path := range paths {
 		info, err := os.Stat(path)
@@ -3229,20 +3483,6 @@ func (a *app) writeCacheStateHeaders(w http.ResponseWriter, state cacheState) {
 // ---------------------------------------------------------------------------
 // Cache path & rating helpers
 // ---------------------------------------------------------------------------
-
-func (a *app) albumCachePath(mode string) (string, error) {
-	if mode == "" {
-		mode = "album"
-	}
-	switch mode {
-	case "album":
-		return a.paths.AlbumCacheFile, nil
-	case "latest":
-		return a.paths.LatestCacheFile, nil
-	default:
-		return "", fmt.Errorf("invalid list mode")
-	}
-}
 
 func (a *app) loadRatings() (map[string]string, error) {
 	data, err := os.ReadFile(a.paths.RatingsCacheFile)

@@ -2,17 +2,13 @@ package com.subclerk.app
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSessionService
-import android.os.Handler
-import android.os.Looper
+import dev.jdtech.mpv.MPVLib
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -21,27 +17,26 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
 
-class PlaybackService : MediaSessionService() {
-    private var mediaSession: MediaSession? = null
-    private var player: ExoPlayer? = null
+class PlaybackService : Service(), MPVLib.EventObserver {
+    private var mpv: MPVLib? = null
     private var sseJob: Job? = null
     private var heartbeatJob: Job? = null
     var deviceId: String? = null
         private set
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val mainHandler = Handler(Looper.getMainLooper())
 
-    // ReplayGain: gain values per playlist index
-    private val replayGainMap = mutableMapOf<Int, Pair<Double, Double>>() // index -> (trackGain, albumGain)
     // Track which playlist indices are playing from offline cache
     private val offlineIndexes = mutableSetOf<Int>()
+    // Pending seek after file load (handoff)
+    @Volatile private var pendingSeek: Double? = null
+    @Volatile private var pendingPause: Boolean? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         instance = this
 
-        // Create notification channel and start as foreground service
-        // so we stay alive for device discovery even when not playing
         val channelId = "subclerk_service"
         val nm = getSystemService(NotificationManager::class.java)
         if (nm.getNotificationChannel(channelId) == null) {
@@ -63,51 +58,62 @@ class PlaybackService : MediaSessionService() {
             startForeground(1, notification)
         }
 
-        val exo = ExoPlayer.Builder(this).build()
-        player = exo
-        mediaSession = MediaSession.Builder(this, exo).build()
-
-        exo.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_ENDED) {
-                    // Auto-advance handled by master queue
-                }
-            }
-
-            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                applyReplayGain()
-            }
-        })
-
+        initMpv()
         registerAndConnect()
     }
 
-    private fun applyReplayGain() {
-        val p = player ?: return
-        val prefs = getSharedPreferences("subclerk", MODE_PRIVATE)
-        val mode = prefs.getString("replaygain", "off") ?: "off"
-        if (mode == "off") {
-            p.volume = 1.0f
+    private fun initMpv() {
+        val m = MPVLib.create(applicationContext) ?: run {
+            android.util.Log.e("PlaybackService", "Failed to create mpv instance")
             return
         }
-        val idx = p.currentMediaItemIndex
-        val gains = replayGainMap[idx]
-        if (gains == null) {
-            p.volume = 1.0f
-            return
+        // Audio-only, no video
+        m.setOptionString("vid", "no")
+        m.setOptionString("vo", "null")
+        m.setOptionString("ao", "audiotrack")
+        m.setOptionString("idle", "yes")
+        m.setOptionString("cache", "yes")
+        m.setOptionString("demuxer-max-bytes", "50MiB")
+        m.setOptionString("demuxer-max-back-bytes", "25MiB")
+
+        m.init()
+        m.addObserver(this)
+        mpv = m
+        android.util.Log.d("PlaybackService", "mpv initialized")
+    }
+
+    // MPVLib.EventObserver
+    override fun eventProperty(property: String) {}
+    override fun eventProperty(property: String, value: Long) {}
+    override fun eventProperty(property: String, value: Double) {}
+    override fun eventProperty(property: String, value: Boolean) {}
+    override fun eventProperty(property: String, value: String) {}
+    override fun event(eventId: Int) {
+        // eventId 8 = FILE_LOADED
+        if (eventId == 8) {
+            applyPendingSeek("event")
         }
-        val gain = if (mode == "album") gains.second else gains.first
-        // Convert dB gain to linear volume: 10^(gain/20)
-        val linear = Math.pow(10.0, gain / 20.0).toFloat().coerceIn(0f, 4f)
-        android.util.Log.d("PlaybackService", "ReplayGain: mode=$mode idx=$idx gain=${gain}dB volume=$linear")
-        p.volume = linear
+    }
+
+    private fun applyPendingSeek(source: String) {
+        val seek = pendingSeek
+        val pause = pendingPause
+        if (seek == null && pause == null) return
+        pendingSeek = null
+        pendingPause = null
+        if (seek != null && seek > 0) {
+            android.util.Log.d("PlaybackService", "applying pending seek ($source): $seek")
+            mpv?.command(arrayOf("seek", seek.toString(), "absolute"))
+        }
+        if (pause != null) {
+            mpv?.setPropertyBoolean("pause", pause)
+        }
     }
 
     fun registerAndConnect() {
         val api = SubclerkApp.instance.api
         if (!api.isConfigured) return
 
-        // Cancel previous connections
         sseJob?.cancel()
         heartbeatJob?.cancel()
 
@@ -116,9 +122,9 @@ class PlaybackService : MediaSessionService() {
             val name = prefs.getString("device_name", null) ?: "android-${android.os.Build.MODEL}".replace(" ", "-").lowercase()
             val format = prefs.getString("audio_format", "") ?: ""
             val bitrate = prefs.getInt("audio_bitrate", 0)
-            // Only pass navidrome_url when on external network
             val navidromeUrl = if (SubclerkApp.instance.isOnHomeWifi()) "" else (prefs.getString("navidrome_url", "") ?: "")
             val replaygain = prefs.getString("replaygain", "off") ?: "off"
+            api.deviceSecret = prefs.getString("device_secret", "") ?: ""
 
             val id = api.registerDevice(name, format, bitrate, navidromeUrl, replaygain)
             if (id.isNullOrBlank()) {
@@ -128,21 +134,17 @@ class PlaybackService : MediaSessionService() {
             android.util.Log.d("PlaybackService", "Registered as device: $id")
             deviceId = id
 
-            // Start SSE listener so we receive commands when this device becomes active
             sseJob = scope.launch { listenSSE(id) }
 
-            // Report playback status every second so handoff captures accurate position
             heartbeatJob = scope.launch {
                 var heartbeatCounter = 0
                 while (isActive) {
                     delay(1_000)
-                    // Read player state on main thread (ExoPlayer requirement)
-                    val snapshot = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        val p = player ?: return@withContext null
-                        Triple(!p.isPlaying, p.currentPosition / 1000.0, p.duration.let { if (it > 0) it / 1000.0 else 0.0 }) to p.currentMediaItemIndex
-                    } ?: continue
-                    val (state, playlistPos) = snapshot
-                    val (paused, timePos, duration) = state
+                    val m = mpv ?: continue
+                    val paused = m.getPropertyBoolean("pause") ?: true
+                    val timePos = m.getPropertyDouble("time-pos") ?: 0.0
+                    val duration = m.getPropertyDouble("duration") ?: 0.0
+                    val playlistPos = m.getPropertyInt("playlist-pos")?.toInt() ?: 0
                     api.reportStatus(
                         id = id,
                         pause = paused,
@@ -150,34 +152,26 @@ class PlaybackService : MediaSessionService() {
                         duration = duration,
                         playlistPos = playlistPos
                     )
-                    // Heartbeat every 10s
                     heartbeatCounter++
                     if (heartbeatCounter >= 10) {
                         heartbeatCounter = 0
-                        api.heartbeat(id)
+                        val ok = api.heartbeat(id)
+                        if (!ok) {
+                            android.util.Log.w("PlaybackService", "Heartbeat failed, re-registering device")
+                            registerAndConnect()
+                            return@launch
+                        }
                     }
                 }
             }
         }
     }
 
-    private fun scheduleStatusReport() {
-        val id = deviceId ?: return
-        // Delay slightly so ExoPlayer resolves duration
-        mainHandler.postDelayed({
-            val p = player ?: return@postDelayed
-            val paused = !p.isPlaying
-            val timePos = p.currentPosition / 1000.0
-            val duration = p.duration.let { if (it > 0) it / 1000.0 else 0.0 }
-            val playlistPos = p.currentMediaItemIndex
-            scope.launch {
-                SubclerkApp.instance.api.reportStatus(id, paused, timePos, duration, playlistPos)
-            }
-        }, 500)
-    }
-
     val isCurrentTrackOffline: Boolean
-        get() = player?.let { offlineIndexes.contains(it.currentMediaItemIndex) } ?: false
+        get() {
+            val pos = mpv?.getPropertyInt("playlist-pos")?.toInt() ?: return false
+            return offlineIndexes.contains(pos)
+        }
 
     companion object {
         var instance: PlaybackService? = null
@@ -187,7 +181,7 @@ class PlaybackService : MediaSessionService() {
     private suspend fun listenSSE(id: String) {
         val api = SubclerkApp.instance.api
         val sseClient = OkHttpClient.Builder()
-            .readTimeout(0, TimeUnit.SECONDS) // infinite for SSE
+            .readTimeout(0, TimeUnit.SECONDS)
             .build()
 
         while (true) {
@@ -198,6 +192,11 @@ class PlaybackService : MediaSessionService() {
                 sseClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) {
                         android.util.Log.e("PlaybackService", "SSE connection failed: ${resp.code}")
+                        if (resp.code == 404) {
+                            android.util.Log.w("PlaybackService", "Device gone from server, re-registering")
+                            registerAndConnect()
+                            return
+                        }
                         return@use
                     }
                     android.util.Log.d("PlaybackService", "SSE connected")
@@ -210,7 +209,7 @@ class PlaybackService : MediaSessionService() {
                             try {
                                 val cmd = JSONObject(data)
                                 android.util.Log.d("PlaybackService", "SSE cmd: ${cmd.optString("action")}")
-                                mainHandler.post { handleCommand(cmd) }
+                                handleCommand(cmd)
                             } catch (e: Exception) {
                                 android.util.Log.e("PlaybackService", "SSE parse error: ${e.message}")
                             }
@@ -220,13 +219,21 @@ class PlaybackService : MediaSessionService() {
                 }
             } catch (e: Exception) {
                 android.util.Log.e("PlaybackService", "SSE error: ${e.message}")
-                delay(5000) // reconnect after error
             }
+            delay(5000)
         }
     }
 
+    private fun resolveUrl(url: String, songId: String): String {
+        if (songId.isNotBlank()) {
+            val localPath = SubclerkApp.instance.offlineManager.getLocalPath(songId)
+            if (localPath != null) return localPath
+        }
+        return url
+    }
+
     private fun handleCommand(cmd: JSONObject) {
-        val p = player ?: return
+        val m = mpv ?: return
         val action = cmd.optString("action")
         val data = cmd.optJSONObject("data")
 
@@ -235,101 +242,134 @@ class PlaybackService : MediaSessionService() {
                 val url = data?.optString("url") ?: return
                 val mode = data.optString("mode", "replace")
                 val songId = data.optString("song_id", "")
-                android.util.Log.d("PlaybackService", "load: mode=$mode songId=$songId url=${url.take(80)}...")
-                // Use offline file if available
-                val offline = SubclerkApp.instance.offlineManager
-                val localPath = if (songId.isNotBlank()) offline.getLocalPath(songId) else null
-                val mediaUri = localPath ?: url
-                val item = MediaItem.fromUri(mediaUri)
-                // Extract ReplayGain data
-                val rg = data.optJSONObject("replay_gain")
-                val trackGain = rg?.optDouble("track_gain", 0.0) ?: 0.0
-                val albumGain = rg?.optDouble("album_gain", 0.0) ?: 0.0
+                val autoplay = data.optBoolean("autoplay", true)
+                val resolvedUrl = resolveUrl(url, songId)
+                val isOffline = resolvedUrl != url
+
+                android.util.Log.d("PlaybackService", "load: mode=$mode songId=$songId autoplay=$autoplay url=${url.take(80)}...")
+
                 when (mode) {
                     "replace" -> {
-                        replayGainMap.clear()
                         offlineIndexes.clear()
-                        replayGainMap[0] = Pair(trackGain, albumGain)
-                        if (localPath != null) offlineIndexes.add(0)
-                        p.setMediaItem(item)
-                        p.prepare()
-                        p.play()
-                        applyReplayGain()
-                        scheduleStatusReport()
+                        if (isOffline) offlineIndexes.add(0)
+                        m.command(arrayOf("loadfile", resolvedUrl, "replace"))
+                        if (!autoplay) {
+                            m.setPropertyBoolean("pause", true)
+                        }
+                        applyReplayGain(data)
                     }
                     "append", "append-play" -> {
-                        val idx = p.mediaItemCount
-                        replayGainMap[idx] = Pair(trackGain, albumGain)
-                        if (localPath != null) offlineIndexes.add(idx)
-                        p.addMediaItem(item)
-                        if (p.mediaItemCount == 1 || mode == "append-play") {
-                            p.seekTo(p.mediaItemCount - 1, 0)
-                            p.prepare()
-                            p.play()
-                            applyReplayGain()
-                            scheduleStatusReport()
+                        val idx = (m.getPropertyInt("playlist-count") ?: 0).toInt()
+                        if (isOffline) offlineIndexes.add(idx)
+                        if (mode == "append-play") {
+                            m.command(arrayOf("loadfile", resolvedUrl, "append-play"))
+                        } else {
+                            m.command(arrayOf("loadfile", resolvedUrl, "append"))
                         }
                     }
                 }
             }
-            "play" -> { p.prepare(); p.play(); scheduleStatusReport() }
-            "pause" -> p.pause()
-            "stop" -> { p.pause(); p.seekTo(0) }
+            "play" -> m.setPropertyBoolean("pause", false)
+            "pause" -> m.setPropertyBoolean("pause", true)
+            "stop" -> {
+                m.setPropertyBoolean("pause", true)
+                m.setPropertyDouble("time-pos", 0.0)
+            }
             "seek" -> {
                 val pos = data?.optDouble("position", -1.0) ?: -1.0
-                if (pos >= 0) p.seekTo((pos * 1000).toLong())
+                if (pos >= 0) m.setPropertyDouble("time-pos", pos)
             }
-            "next" -> {
-                if (p.hasNextMediaItem()) p.seekToNextMediaItem()
-            }
-            "prev" -> {
-                if (p.hasPreviousMediaItem()) p.seekToPreviousMediaItem()
-            }
+            "next" -> m.command(arrayOf("playlist-next"))
+            "prev" -> m.command(arrayOf("playlist-prev"))
             "clear" -> {
-                replayGainMap.clear()
                 offlineIndexes.clear()
-                p.clearMediaItems()
-                p.stop()
+                m.command(arrayOf("stop"))
+                m.command(arrayOf("playlist-clear"))
             }
             "playlist-remove" -> {
                 val idx = data?.optInt("index", -1) ?: -1
-                if (idx in 0 until p.mediaItemCount) p.removeMediaItem(idx)
+                if (idx >= 0) m.command(arrayOf("playlist-remove", idx.toString()))
             }
             "playlist-move" -> {
                 val from = data?.optInt("from", -1) ?: -1
                 val to = data?.optInt("to", -1) ?: -1
-                if (from in 0 until p.mediaItemCount && to in 0..p.mediaItemCount) {
-                    p.moveMediaItem(from, to)
-                }
+                if (from >= 0 && to >= 0) m.command(arrayOf("playlist-move", from.toString(), to.toString()))
             }
             "handoff" -> {
-                // Atomic handoff: seek to correct track + position after playlist is loaded
                 val pos = data?.optInt("playlist_pos", 0) ?: 0
                 val timePos = data?.optDouble("time_pos", 0.0) ?: 0.0
                 val paused = data?.optBoolean("paused", false) ?: false
-                android.util.Log.d("PlaybackService", "handoff: pos=$pos timePos=$timePos paused=$paused items=${p.mediaItemCount}")
-                if (pos in 0 until p.mediaItemCount) {
-                    p.seekTo(pos, (timePos * 1000).toLong())
-                    p.prepare()
-                    if (!paused) p.play() else p.pause()
+                val tracksArr = data?.optJSONArray("tracks")
+
+                pendingSeek = timePos
+                pendingPause = paused
+
+                if (tracksArr != null && tracksArr.length() > 0) {
+                    offlineIndexes.clear()
+                    m.command(arrayOf("stop"))
+                    m.command(arrayOf("playlist-clear"))
+                    for (i in 0 until tracksArr.length()) {
+                        val t = tracksArr.getJSONObject(i)
+                        val url = t.optString("url")
+                        val songId = t.optString("song_id", "")
+                        val resolvedUrl = resolveUrl(url, songId)
+                        if (resolvedUrl != url) offlineIndexes.add(i)
+                        m.command(arrayOf("loadfile", resolvedUrl, "append"))
+                    }
                 }
-                scheduleStatusReport()
+
+                android.util.Log.d("PlaybackService", "handoff: pos=$pos timePos=$timePos paused=$paused")
+                m.setPropertyInt("playlist-pos", pos)
+                applyReplayGainForCurrentTrack()
+
+                // Fallback: if FILE_LOADED already fired (mpv auto-loaded pos 0),
+                // the event won't fire again. Try applying seek after a brief yield.
+                scope.launch {
+                    delay(200)
+                    applyPendingSeek("fallback")
+                }
             }
             "set-property" -> {
                 val name = data?.optString("name") ?: return
                 if (name == "playlist-pos") {
                     val pos = data.optInt("value", -1)
-                    if (pos in 0 until p.mediaItemCount) {
-                        p.seekTo(pos, 0)
-                        p.prepare()
-                        p.play()
+                    if (pos >= 0) {
+                        m.setPropertyInt("playlist-pos", pos)
+                        m.setPropertyBoolean("pause", false)
                     }
                 }
             }
         }
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+    private fun applyReplayGain(trackData: JSONObject?) {
+        val m = mpv ?: return
+        val prefs = getSharedPreferences("subclerk", MODE_PRIVATE)
+        val mode = prefs.getString("replaygain", "off") ?: "off"
+        if (mode == "off") {
+            m.setPropertyDouble("volume", 100.0)
+            return
+        }
+        val rg = trackData?.optJSONObject("replay_gain")
+        if (rg == null) {
+            m.setPropertyDouble("volume", 100.0)
+            return
+        }
+        val gain = if (mode == "album") rg.optDouble("album_gain", 0.0) else rg.optDouble("track_gain", 0.0)
+        val linear = Math.pow(10.0, gain / 20.0).coerceIn(0.0, 4.0)
+        m.setPropertyDouble("volume", linear * 100.0)
+        android.util.Log.d("PlaybackService", "ReplayGain: mode=$mode gain=${gain}dB volume=${linear * 100}")
+    }
+
+    private fun applyReplayGainForCurrentTrack() {
+        val prefs = getSharedPreferences("subclerk", MODE_PRIVATE)
+        val mode = prefs.getString("replaygain", "off") ?: "off"
+        if (mode == "off") {
+            mpv?.setPropertyDouble("volume", 100.0)
+        }
+        // ReplayGain metadata not available in handoff context, reset to default
+        mpv?.setPropertyDouble("volume", 100.0)
+    }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         // Keep running for device discovery and playback
@@ -339,12 +379,12 @@ class PlaybackService : MediaSessionService() {
         sseJob?.cancel()
         heartbeatJob?.cancel()
         scope.cancel()
-        mediaSession?.run {
-            player.release()
-            release()
+        mpv?.let {
+            it.removeObserver(this)
+            it.destroy()
         }
-        mediaSession = null
-        player = null
+        mpv = null
+        instance = null
         super.onDestroy()
     }
 }

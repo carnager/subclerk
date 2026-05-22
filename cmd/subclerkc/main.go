@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/carnager/subclerk/internal/shared"
 )
 
@@ -25,16 +27,41 @@ Commands:
   device    Switch active device: device <name>
 `
 
+type cliConfig struct {
+	Master string `toml:"master"`
+	Secret string `toml:"secret"`
+}
+
 var (
+	cfg     cliConfig
 	baseURL string
 	client  *http.Client
 )
 
+func loadConfig() cliConfig {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return cliConfig{}
+	}
+	xdgConfig := shared.Getenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	configPath := filepath.Join(xdgConfig, "subclerk", "subclerkc.toml")
+	var c cliConfig
+	if _, err := toml.DecodeFile(configPath, &c); err != nil {
+		return cliConfig{}
+	}
+	return c
+}
+
 func initClient() {
+	cfg = loadConfig()
+	address := cfg.Master
+	if address == "" {
+		address = "local"
+	}
 	var useLocal bool
 	var socketPath string
 	var err error
-	baseURL, useLocal, socketPath, err = shared.APIBaseURLFromAddress("local")
+	baseURL, useLocal, socketPath, err = shared.APIBaseURLFromAddress(address)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -57,6 +84,9 @@ func apiDo(method, path string, body string) ([]byte, error) {
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if cfg.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Secret)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -109,12 +139,12 @@ func main() {
 }
 
 type deviceInfo struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	IsLocal  bool   `json:"is_local"`
-	Online   bool   `json:"online"`
-	Format   string `json:"format"`
-	BitRate  int    `json:"max_bitrate"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	IsLocal bool   `json:"is_local"`
+	Online  bool   `json:"online"`
+	Format  string `json:"format"`
+	BitRate int    `json:"max_bitrate"`
 }
 
 type activeDevice struct {

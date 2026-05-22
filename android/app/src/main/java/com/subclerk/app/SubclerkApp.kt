@@ -27,6 +27,7 @@ class SubclerkApp : Application() {
 
     fun applyServerForCurrentNetwork() {
         val prefs = getSharedPreferences("subclerk", Context.MODE_PRIVATE)
+        val secret = prefs.getString("device_secret", "") ?: ""
         val onHome = isOnHomeWifi()
         val server = if (onHome) {
             prefs.getString("server", "") ?: ""
@@ -37,14 +38,14 @@ class SubclerkApp : Application() {
         android.util.Log.d("SubclerkApp", "Network: onHome=$onHome server=$server ssid=${getCurrentSSID()}")
         if (::api.isInitialized) {
             val oldBase = api.baseUrl
-            val newApi = SubclerkApi(server)
+            val newApi = SubclerkApi(server).apply { deviceSecret = secret }
             if (oldBase != newApi.baseUrl) {
                 android.util.Log.d("SubclerkApp", "Switching API: $oldBase -> ${newApi.baseUrl}")
                 api = newApi
                 PlaybackService.instance?.registerAndConnect()
             }
         } else {
-            api = SubclerkApi(server)
+            api = SubclerkApi(server).apply { deviceSecret = secret }
             android.util.Log.d("SubclerkApp", "Initial API: ${api.baseUrl}")
         }
     }

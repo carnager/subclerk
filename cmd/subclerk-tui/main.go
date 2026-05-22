@@ -30,6 +30,7 @@ import (
 
 type tuiConfig struct {
 	Master string `toml:"master"` // e.g. "local", "192.168.1.10:6701"
+	Secret string `toml:"secret"` // shared API secret
 }
 
 var cfg tuiConfig
@@ -86,8 +87,12 @@ func ensureAgent() {
 	}
 
 	// Try to reach the agent health endpoint
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://" + agentAddr + "/agent/v1/health")
+	agentClient := &http.Client{Timeout: 2 * time.Second}
+	agentReq, _ := http.NewRequest("GET", "http://"+agentAddr+"/agent/v1/health", nil)
+	if cfg.Secret != "" {
+		agentReq.Header.Set("Authorization", "Bearer "+cfg.Secret)
+	}
+	resp, err := agentClient.Do(agentReq)
 	if err == nil {
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
@@ -169,6 +174,9 @@ func apiCall(method, path string, body string) ([]byte, error) {
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if cfg.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Secret)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -312,13 +320,14 @@ type model struct {
 	queue  []queueItem
 
 	// library
-	libMode    libView
-	artists    []string
-	albums     []albumEntry
-	tracks     []trackEntry
-	curArtist  string
-	libCursor  int
-	libOffset  int
+	libMode      libView
+	libSortMtime bool
+	artists      []string
+	albums       []albumEntry
+	tracks       []trackEntry
+	curArtist    string
+	libCursor    int
+	libOffset    int
 
 	// queue
 	qCursor      int
@@ -402,6 +411,36 @@ func fetchArtists() tea.Msg {
 	var artists []string
 	_ = apiJSON("GET", "browse/artists", "", &artists)
 	return artistsMsg(artists)
+}
+
+func fetchLatestArtists() tea.Msg {
+	var albums []albumEntry
+	_ = apiJSON("GET", "albums?sort=latest", "", &albums)
+	// Extract unique artists in mtime order
+	seen := map[string]bool{}
+	var artists []string
+	for _, a := range albums {
+		if !seen[a.AlbumArtist] {
+			seen[a.AlbumArtist] = true
+			artists = append(artists, a.AlbumArtist)
+		}
+	}
+	return artistsMsg(artists)
+}
+
+func fetchLatestAlbums(artist string) tea.Cmd {
+	return func() tea.Msg {
+		var albums []albumEntry
+		_ = apiJSON("GET", "albums?sort=latest", "", &albums)
+		// Filter for this artist
+		var filtered []albumEntry
+		for _, a := range albums {
+			if a.AlbumArtist == artist {
+				filtered = append(filtered, a)
+			}
+		}
+		return albumsMsg(filtered)
+	}
 }
 
 func fetchAlbums(artist string) tea.Cmd {
@@ -864,6 +903,17 @@ func (m model) handleLibKey(key string) (tea.Model, tea.Cmd) {
 		return m.libAction("replace")
 	case "i": // insert
 		return m.libAction("insert")
+	case "S": // toggle sort
+		if m.libMode == libArtists || (m.libMode == libAlbums && m.libSortMtime) {
+			m.libSortMtime = !m.libSortMtime
+			m.libMode = libArtists
+			m.libCursor = 0
+			m.libOffset = 0
+			if m.libSortMtime {
+				return m, fetchLatestArtists
+			}
+			return m, fetchArtists
+		}
 	}
 	return m, nil
 }
@@ -898,6 +948,9 @@ func (m model) libDrillIn() (tea.Model, tea.Cmd) {
 	case libArtists:
 		if di < len(m.artists) {
 			m.curArtist = m.artists[di]
+			if m.libSortMtime {
+				return m, fetchLatestAlbums(m.curArtist)
+			}
 			return m, fetchAlbums(m.curArtist)
 		}
 	case libAlbums:
@@ -937,9 +990,20 @@ func (m model) libAction(mode string) (tea.Model, tea.Cmd) {
 	case libArtists:
 		if di < len(m.artists) {
 			name := m.artists[di]
+			sortMtime := m.libSortMtime
 			return m, func() tea.Msg {
 				var albums []albumEntry
-				_ = apiJSON("GET", "browse/albums?artist="+url.QueryEscape(name), "", &albums)
+				if sortMtime {
+					var all []albumEntry
+					_ = apiJSON("GET", "albums?sort=latest", "", &all)
+					for _, a := range all {
+						if a.AlbumArtist == name {
+							albums = append(albums, a)
+						}
+					}
+				} else {
+					_ = apiJSON("GET", "browse/albums?artist="+url.QueryEscape(name), "", &albums)
+				}
 				if len(albums) == 0 {
 					return fetchStatus()
 				}
@@ -1298,7 +1362,11 @@ func (m model) libraryView(w, h int) string {
 
 	switch m.libMode {
 	case libArtists:
-		title = fmt.Sprintf("Artists (%d)", len(m.artists))
+		sortLabel := "A-Z"
+		if m.libSortMtime {
+			sortLabel = "Recent"
+		}
+		title = fmt.Sprintf("Artists (%d) [%s]", len(m.artists), sortLabel)
 		for i, a := range m.artists {
 			items = append(items, m.libRow(i, a, "", w))
 		}
@@ -1544,6 +1612,7 @@ func (m model) helpView() string {
 		{"Library", strings.Join([]string{
 			"  j/k        Navigate up/down",
 			"  Enter      Action menu (Add/Insert/Replace/Browse)",
+			"  S          Toggle sort (A-Z / recent)",
 			"  PgUp/PgDn  Jump 20 items",
 			"  g/G        Go to first/last",
 		}, "\n")},

@@ -19,6 +19,7 @@ import (
 type config struct {
 	API struct {
 		Address string `toml:"address"`
+		Secret  string `toml:"secret"`
 	} `toml:"api"`
 	Upload struct {
 		Host string `toml:"host"`
@@ -59,7 +60,7 @@ func main() {
 	tempHTMLFile := cfg.Output.TempFile
 
 	logf(start, "Loading albums from Subclerk API...")
-	albumsRaw, err := fetchAlbums(cfg.API.Address)
+	albumsRaw, err := fetchAlbums(cfg.API.Address, cfg.API.Secret)
 	if err != nil {
 		fatal(start, fmt.Errorf("fetch albums: %w", err))
 	}
@@ -159,7 +160,7 @@ func applyDefaults(cfg *config) {
 	}
 }
 
-func fetchAlbums(address string) ([]map[string]any, error) {
+func fetchAlbums(address, secret string) ([]map[string]any, error) {
 	baseURL, useLocalSocket, socketPath, err := shared.APIBaseURLFromAddress(address)
 	if err != nil {
 		return nil, err
@@ -169,7 +170,14 @@ func fetchAlbums(address string) ([]map[string]any, error) {
 		client = shared.NewLocalHTTPClient(30*time.Second, socketPath)
 	}
 
-	resp, err := client.Get(baseURL + "/albums")
+	req, err := http.NewRequest("GET", baseURL+"/albums", nil)
+	if err != nil {
+		return nil, err
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

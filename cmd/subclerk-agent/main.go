@@ -32,6 +32,7 @@ type agentConfig struct {
 		Master     string `toml:"master"`
 		Format     string `toml:"format"`
 		MaxBitRate int    `toml:"max_bitrate"`
+		Secret     string `toml:"secret"`
 	} `toml:"agent"`
 	MPV struct {
 		Socket     string `toml:"socket"`
@@ -255,6 +256,7 @@ bind = "0.0.0.0:6702"
 master = "localhost:6701"
 format = ""
 max_bitrate = 0
+secret = ""
 
 [mpv]
 socket = ""
@@ -294,6 +296,18 @@ func (a *agent) registerAndHeartbeat() {
 	}
 }
 
+func (a *agent) masterPost(client *http.Client, url string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if a.cfg.Agent.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.Agent.Secret)
+	}
+	return client.Do(req)
+}
+
 func (a *agent) register(client *http.Client) string {
 	regBody, _ := json.Marshal(map[string]any{
 		"name":        a.cfg.Agent.Name,
@@ -303,11 +317,7 @@ func (a *agent) register(client *http.Client) string {
 	})
 
 	for {
-		resp, err := client.Post(
-			"http://"+a.cfg.Agent.Master+"/api/v1/devices/register",
-			"application/json",
-			bytes.NewReader(regBody),
-		)
+		resp, err := a.masterPost(client, "http://"+a.cfg.Agent.Master+"/api/v1/devices/register", regBody)
 		if err != nil {
 			a.logger.Printf("registration failed: %v (retrying in 5s)", err)
 			time.Sleep(5 * time.Second)
@@ -327,11 +337,7 @@ func (a *agent) heartbeatLoop(client *http.Client, agentID string) {
 	for {
 		time.Sleep(10 * time.Second)
 		hbBody, _ := json.Marshal(map[string]string{"id": agentID})
-		resp, err := client.Post(
-			"http://"+a.cfg.Agent.Master+"/api/v1/devices/heartbeat",
-			"application/json",
-			bytes.NewReader(hbBody),
-		)
+		resp, err := a.masterPost(client, "http://"+a.cfg.Agent.Master+"/api/v1/devices/heartbeat", hbBody)
 		if err != nil {
 			failures++
 			a.logger.Printf("heartbeat failed (%d/3): %v", failures, err)
@@ -354,22 +360,35 @@ func (a *agent) heartbeatLoop(client *http.Client, agentID string) {
 // Routes
 // ---------------------------------------------------------------------------
 
+func (a *agent) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.Agent.Secret != "" {
+			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if token != a.cfg.Agent.Secret {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
 func (a *agent) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /agent/v1/health", a.handleHealth)
-	mux.HandleFunc("POST /agent/v1/load", a.handleLoad)
-	mux.HandleFunc("POST /agent/v1/play", a.handlePlay)
-	mux.HandleFunc("POST /agent/v1/pause", a.handlePause)
-	mux.HandleFunc("POST /agent/v1/stop", a.handleStop)
-	mux.HandleFunc("POST /agent/v1/seek", a.handleSeek)
-	mux.HandleFunc("POST /agent/v1/next", a.handleNext)
-	mux.HandleFunc("POST /agent/v1/prev", a.handlePrev)
-	mux.HandleFunc("POST /agent/v1/playlist-clear", a.handlePlaylistClear)
-	mux.HandleFunc("POST /agent/v1/playlist-move", a.handlePlaylistMove)
-	mux.HandleFunc("POST /agent/v1/playlist-remove", a.handlePlaylistRemove)
-	mux.HandleFunc("POST /agent/v1/set-property", a.handleSetProperty)
-	mux.HandleFunc("POST /agent/v1/handoff", a.handleHandoff)
-	mux.HandleFunc("GET /agent/v1/status", a.handleStatus)
+	mux.HandleFunc("GET /agent/v1/health", a.requireAuth(a.handleHealth))
+	mux.HandleFunc("POST /agent/v1/load", a.requireAuth(a.handleLoad))
+	mux.HandleFunc("POST /agent/v1/play", a.requireAuth(a.handlePlay))
+	mux.HandleFunc("POST /agent/v1/pause", a.requireAuth(a.handlePause))
+	mux.HandleFunc("POST /agent/v1/stop", a.requireAuth(a.handleStop))
+	mux.HandleFunc("POST /agent/v1/seek", a.requireAuth(a.handleSeek))
+	mux.HandleFunc("POST /agent/v1/next", a.requireAuth(a.handleNext))
+	mux.HandleFunc("POST /agent/v1/prev", a.requireAuth(a.handlePrev))
+	mux.HandleFunc("POST /agent/v1/playlist-clear", a.requireAuth(a.handlePlaylistClear))
+	mux.HandleFunc("POST /agent/v1/playlist-move", a.requireAuth(a.handlePlaylistMove))
+	mux.HandleFunc("POST /agent/v1/playlist-remove", a.requireAuth(a.handlePlaylistRemove))
+	mux.HandleFunc("POST /agent/v1/set-property", a.requireAuth(a.handleSetProperty))
+	mux.HandleFunc("POST /agent/v1/handoff", a.requireAuth(a.handleHandoff))
+	mux.HandleFunc("GET /agent/v1/status", a.requireAuth(a.handleStatus))
 	return mux
 }
 

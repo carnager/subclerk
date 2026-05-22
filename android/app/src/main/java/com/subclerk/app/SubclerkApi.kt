@@ -12,10 +12,11 @@ import java.util.concurrent.TimeUnit
 
 data class Album(val id: String, val albumArtist: String, val album: String, val date: String)
 data class Track(val id: String, val songId: String, val title: String, val artist: String, val album: String, val trackNumber: Int)
-data class QueueItem(val position: Int, val songId: String, val title: String, val artist: String, val album: String, val duration: Double, val current: Boolean)
-data class PlaybackStatus(val state: String, val title: String, val artist: String, val album: String, val date: String, val timePos: Double, val duration: Double)
+data class QueueItem(val position: Int, val songId: String, val title: String, val artist: String, val album: String, val albumId: String, val duration: Double, val current: Boolean)
+data class PlaybackStatus(val state: String, val title: String, val artist: String, val album: String, val date: String, val albumId: String, val timePos: Double, val duration: Double)
 data class DeviceInfo(val id: String, val name: String, val isLocal: Boolean, val type: String, val online: Boolean, val format: String, val maxBitrate: Int, val active: Boolean)
 data class SearchResult(val albums: List<Album>, val tracks: List<Track>)
+data class PlaylistInfo(val id: String, val name: String, val songCount: Int, val duration: Int, val coverArt: String)
 
 class SubclerkApi(private val server: String) {
     private val client = OkHttpClient.Builder()
@@ -24,6 +25,8 @@ class SubclerkApi(private val server: String) {
         .build()
 
     private val json = "application/json".toMediaType()
+
+    var deviceSecret: String = ""
 
     val baseUrl: String
         get() = if (server.isBlank()) "" else {
@@ -35,10 +38,15 @@ class SubclerkApi(private val server: String) {
     val isConfigured: Boolean
         get() = server.isNotBlank()
 
+    private fun Request.Builder.withAuth(): Request.Builder {
+        if (deviceSecret.isNotBlank()) header("Authorization", "Bearer $deviceSecret")
+        return this
+    }
+
     private suspend fun get(path: String): String? = withContext(Dispatchers.IO) {
         if (!isConfigured) return@withContext null
         try {
-            val req = Request.Builder().url("$baseUrl/$path").build()
+            val req = Request.Builder().url("$baseUrl/$path").withAuth().build()
             client.newCall(req).execute().use { it.body?.string() }
         } catch (e: Exception) {
             null
@@ -49,7 +57,7 @@ class SubclerkApi(private val server: String) {
         if (!isConfigured) return@withContext null
         try {
             val reqBody = body.toRequestBody(json)
-            val req = Request.Builder().url("$baseUrl/$path").post(reqBody).build()
+            val req = Request.Builder().url("$baseUrl/$path").withAuth().post(reqBody).build()
             client.newCall(req).execute().use { it.body?.string() }
         } catch (e: Exception) {
             null
@@ -59,7 +67,7 @@ class SubclerkApi(private val server: String) {
     private suspend fun delete(path: String): String? = withContext(Dispatchers.IO) {
         if (!isConfigured) return@withContext null
         try {
-            val req = Request.Builder().url("$baseUrl/$path").delete().build()
+            val req = Request.Builder().url("$baseUrl/$path").withAuth().delete().build()
             client.newCall(req).execute().use { it.body?.string() }
         } catch (e: Exception) {
             null
@@ -78,6 +86,11 @@ class SubclerkApi(private val server: String) {
 
     suspend fun getAlbums(artist: String): List<Album> {
         val data = get("browse/albums?artist=${java.net.URLEncoder.encode(artist, "UTF-8")}") ?: return emptyList()
+        return parseAlbums(data)
+    }
+
+    suspend fun getLatestAlbums(): List<Album> {
+        val data = get("albums?sort=latest") ?: return emptyList()
         return parseAlbums(data)
     }
 
@@ -129,6 +142,7 @@ class SubclerkApi(private val server: String) {
                 artist = o.optString("artist"),
                 album = o.optString("album"),
                 date = o.optString("date"),
+                albumId = o.optString("album_id"),
                 timePos = o.optDouble("time_pos", 0.0),
                 duration = o.optDouble("duration", 0.0)
             )
@@ -158,6 +172,7 @@ class SubclerkApi(private val server: String) {
                     title = o.optString("title"),
                     artist = o.optString("artist"),
                     album = o.optString("album"),
+                    albumId = o.optString("album_id"),
                     duration = o.optDouble("duration", 0.0),
                     current = o.optBoolean("current", false)
                 )
@@ -172,7 +187,9 @@ class SubclerkApi(private val server: String) {
 
     // --- Playlist add ---
 
-    suspend fun addAlbum(albumId: String, mode: String) { post("playlist/add/album/$albumId", """{"mode":"$mode"}""") }
+    suspend fun addAlbum(albumId: String, mode: String) {
+        post("playlist/add/album/$albumId", """{"mode":"$mode"}""")
+    }
     suspend fun addTrack(trackId: String, mode: String) { post("playlist/add/track/$trackId", """{"mode":"$mode"}""") }
     suspend fun addAlbums(albumIds: List<String>, mode: String) {
         val ids = albumIds.joinToString(",") { "\"$it\"" }
@@ -216,13 +233,25 @@ class SubclerkApi(private val server: String) {
         return try { JSONObject(data ?: "{}").optString("id") } catch (e: Exception) { null }
     }
 
-    suspend fun heartbeat(id: String) { post("devices/heartbeat", """{"id":"$id"}""") }
+    suspend fun heartbeat(id: String): Boolean = withContext(Dispatchers.IO) {
+        if (!isConfigured) return@withContext false
+        try {
+            val reqBody = """{"id":"$id"}""".toRequestBody(json)
+            val req = Request.Builder().url("$baseUrl/devices/heartbeat").withAuth().post(reqBody).build()
+            client.newCall(req).execute().use { it.isSuccessful }
+        } catch (e: Exception) {
+            false
+        }
+    }
 
     suspend fun reportStatus(id: String, pause: Boolean, timePos: Double, duration: Double, playlistPos: Int) {
         post("devices/status", """{"id":"$id","pause":$pause,"time_pos":$timePos,"duration":$duration,"playlist_pos":$playlistPos}""")
     }
 
-    fun sseUrl(id: String): String = "$baseUrl/devices/stream?id=${java.net.URLEncoder.encode(id, "UTF-8")}"
+    fun sseUrl(id: String): String {
+        val base = "$baseUrl/devices/stream?id=${java.net.URLEncoder.encode(id, "UTF-8")}"
+        return if (deviceSecret.isNotBlank()) "$base&secret=${java.net.URLEncoder.encode(deviceSecret, "UTF-8")}" else base
+    }
 
     // --- Rating ---
 
@@ -246,6 +275,46 @@ class SubclerkApi(private val server: String) {
             if (deviceId.isNotBlank()) "&device_id=${java.net.URLEncoder.encode(deviceId, "UTF-8")}" else ""
         val data = get("stream/url?$params") ?: return null
         return try { JSONObject(data).optString("url") } catch (e: Exception) { null }
+    }
+
+    // --- Playlists ---
+
+    suspend fun getPlaylists(): List<PlaylistInfo> {
+        val data = get("playlists") ?: return emptyList()
+        return try {
+            val arr = JSONArray(data)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                PlaylistInfo(
+                    id = o.optString("id"),
+                    name = o.optString("name"),
+                    songCount = o.optInt("song_count"),
+                    duration = o.optInt("duration"),
+                    coverArt = o.optString("cover_art")
+                )
+            }
+        } catch (e: Exception) { emptyList() }
+    }
+
+    suspend fun getPlaylistTracks(id: String): List<Track> {
+        val data = get("playlists/tracks?id=${java.net.URLEncoder.encode(id, "UTF-8")}") ?: return emptyList()
+        return try {
+            val arr = JSONArray(data)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                Track(o.optString("id"), o.optString("song_id", o.optString("id")), o.optString("title"), o.optString("artist"), o.optString("album"), o.optInt("tracknumber", 0))
+            }
+        } catch (e: Exception) { emptyList() }
+    }
+
+    suspend fun addPlaylist(id: String, mode: String) { post("playlists/add/$id", """{"mode":"$mode"}""") }
+    suspend fun addTrackToPlaylist(playlistId: String, songId: String) { post("playlists/add-track/$playlistId", """{"song_id":"$songId"}""") }
+
+    // --- Cover Art ---
+
+    fun coverUrl(albumId: String, size: Int = 300): String? {
+        if (!isConfigured || albumId.isBlank()) return null
+        return "$baseUrl/cover/${java.net.URLEncoder.encode(albumId, "UTF-8")}?size=$size"
     }
 
     // --- Helpers ---

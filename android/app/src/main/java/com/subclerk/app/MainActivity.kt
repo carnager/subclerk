@@ -19,11 +19,14 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -38,6 +41,14 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
+import androidx.compose.ui.input.pointer.pointerInput
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -49,11 +60,13 @@ import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.FolderOpen
@@ -62,14 +75,17 @@ import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.filled.SortByAlpha
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material3.Card
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilterChip
@@ -89,7 +105,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -98,11 +116,11 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -110,6 +128,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import coil3.compose.AsyncImage
+import coil3.request.ImageRequest
+import coil3.request.crossfade
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -249,9 +270,85 @@ fun MainScreen(vm: MainViewModel) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var showNowPlaying by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var showDevices by remember { mutableStateOf(false) }
+
+    // Derive top bar title from current state
+    val topBarTitle = when (selectedTab) {
+        0 -> when (vm.libView) {
+            LibView.Artists -> "Library"
+            LibView.Albums -> vm.curArtist
+            LibView.Tracks -> vm.curAlbum?.album ?: "Tracks"
+        }
+        1 -> "Search"
+        2 -> "Queue"
+        3 -> if (vm.playlistView) vm.curPlaylist?.name ?: "Playlists" else "Playlists"
+        else -> "Subclerk"
+    }
+    val showBackNav = (selectedTab == 0 && vm.libView != LibView.Artists) ||
+            (selectedTab == 3 && vm.playlistView)
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = {
+                        Text(
+                            topBarTitle,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    },
+                    navigationIcon = {
+                        if (showBackNav) {
+                            IconButton(onClick = {
+                                if (selectedTab == 3 && vm.playlistView) vm.playlistBack()
+                                else vm.libBack()
+                            }) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                            }
+                        }
+                    },
+                    actions = {
+                        // Tab-specific actions
+                        when (selectedTab) {
+                            0 -> if (vm.libView == LibView.Artists) {
+                                IconButton(onClick = { vm.toggleLibSort() }) {
+                                    Icon(
+                                        if (vm.libSort == LibSort.Artist) Icons.Default.Schedule else Icons.Default.SortByAlpha,
+                                        if (vm.libSort == LibSort.Artist) "Sort by recent" else "Sort by artist"
+                                    )
+                                }
+                                IconButton(onClick = { vm.randomAlbum() }) {
+                                    Icon(Icons.Default.Shuffle, "Random album")
+                                }
+                            }
+                            2 -> if (vm.queue.isNotEmpty()) {
+                                IconButton(onClick = { vm.queueClear() }) {
+                                    Icon(Icons.Default.DeleteSweep, "Clear queue")
+                                }
+                            }
+                        }
+                        // Device chooser in top bar
+                        val activeDevice = vm.devices.firstOrNull { it.active }
+                        IconButton(onClick = { vm.loadDevices(); showDevices = true }) {
+                            Icon(
+                                Icons.Default.Devices,
+                                "Devices",
+                                tint = if (activeDevice != null && !activeDevice.isLocal)
+                                    MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        // Settings always available
+                        IconButton(onClick = { showSettings = true }) {
+                            Icon(Icons.Default.Settings, "Settings")
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface
+                    )
+                )
+            },
             bottomBar = {
                 Column {
                     // Download progress
@@ -301,9 +398,9 @@ fun MainScreen(vm: MainViewModel) {
                         )
                         NavigationBarItem(
                             selected = selectedTab == 3,
-                            onClick = { selectedTab = 3; vm.loadDevices() },
-                            icon = { Icon(Icons.Default.Devices, contentDescription = null) },
-                            label = { Text("Devices") }
+                            onClick = { selectedTab = 3; vm.loadPlaylists() },
+                            icon = { Icon(Icons.AutoMirrored.Filled.PlaylistPlay, contentDescription = null) },
+                            label = { Text("Playlists") }
                         )
                     }
                 }
@@ -311,17 +408,27 @@ fun MainScreen(vm: MainViewModel) {
         ) { padding ->
             Box(Modifier.padding(padding)) {
                 when (selectedTab) {
-                    0 -> LibraryScreen(vm, onSettingsClick = { showSettings = true })
+                    0 -> LibraryScreen(vm)
                     1 -> SearchScreen(vm)
-                    2 -> QueueScreen(vm)
-                    3 -> DevicesScreen(vm)
+                    2 -> QueueScreen(vm, onSwitchToLibrary = { selectedTab = 0 })
+                    3 -> PlaylistsScreen(vm)
                 }
             }
         }
 
-        // Action menu
-        if (vm.showActionMenu) {
+        // Action menu (queue items have their own sheet)
+        if (vm.showActionMenu && vm.actionTarget !is MainViewModel.ActionTarget.QueueItemTarget) {
             ActionSheet(vm)
+        }
+
+        // Device chooser bottom sheet
+        if (showDevices) {
+            DevicesSheet(vm, onDismiss = { showDevices = false })
+        }
+
+        // Playlist picker bottom sheet
+        if (vm.showPlaylistPicker) {
+            PlaylistPickerSheet(vm)
         }
 
         // Now Playing overlay
@@ -375,27 +482,33 @@ fun MiniPlayerBar(vm: MainViewModel, onClick: () -> Unit) {
                 modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Small art placeholder
+                // Album art
+                val coverUrl = SubclerkApp.instance.api.coverUrl(st.albumId)
                 Box(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(RoundedCornerShape(8.dp))
-                        .background(
-                            Brush.linearGradient(
-                                listOf(
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.3f),
-                                    MaterialTheme.colorScheme.surfaceVariant
-                                )
-                            )
-                        ),
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        Icons.Default.MusicNote,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
-                    )
+                    if (coverUrl != null) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(SubclerkApp.instance)
+                                .data(coverUrl)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = "Album art",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                        )
+                    } else {
+                        Icon(
+                            Icons.Default.MusicNote,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+                        )
+                    }
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
@@ -492,28 +605,34 @@ fun NowPlayingScreen(vm: MainViewModel, onDismiss: () -> Unit) {
 
             Spacer(Modifier.weight(0.5f))
 
-            // Album art placeholder
+            // Album art
+            val npCoverUrl = st?.albumId?.let { SubclerkApp.instance.api.coverUrl(it, 600) }
             Box(
                 modifier = Modifier
                     .fillMaxWidth(0.8f)
                     .aspectRatio(1f)
                     .clip(RoundedCornerShape(20.dp))
-                    .background(
-                        Brush.linearGradient(
-                            colors = listOf(
-                                MaterialTheme.colorScheme.primaryContainer,
-                                MaterialTheme.colorScheme.surfaceVariant,
-                            )
-                        )
-                    ),
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    Icons.Default.MusicNote,
-                    contentDescription = null,
-                    modifier = Modifier.size(72.dp),
-                    tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)
-                )
+                if (npCoverUrl != null) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(SubclerkApp.instance)
+                            .data(npCoverUrl)
+                            .crossfade(true)
+                            .build(),
+                        contentDescription = "Album art",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                    )
+                } else {
+                    Icon(
+                        Icons.Default.MusicNote,
+                        contentDescription = null,
+                        modifier = Modifier.size(72.dp),
+                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)
+                    )
+                }
             }
 
             Spacer(Modifier.height(36.dp))
@@ -566,16 +685,51 @@ fun NowPlayingScreen(vm: MainViewModel, onDismiss: () -> Unit) {
             var dragValue by remember { mutableFloatStateOf(0f) }
             val displayFraction = if (dragging) dragValue else if (dur > 0) (pos / dur).toFloat().coerceIn(0f, 1f) else 0f
 
-            Slider(
-                value = displayFraction,
-                onValueChange = { dragging = true; dragValue = it },
-                onValueChangeFinished = {
-                    vm.seek(dragValue.toDouble() * dur)
-                    dragging = false
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = dur > 0
-            )
+            Column(Modifier.fillMaxWidth()) {
+                // Custom seek bar
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(32.dp)
+                        .clickable(enabled = false, onClick = {}),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    // Track background
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f))
+                    )
+                    // Track progress
+                    Box(
+                        Modifier
+                            .fillMaxWidth(displayFraction)
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(MaterialTheme.colorScheme.primary)
+                    )
+                    // Invisible slider on top for interaction
+                    Slider(
+                        value = displayFraction,
+                        onValueChange = { dragging = true; dragValue = it },
+                        onValueChangeFinished = {
+                            vm.seek(dragValue.toDouble() * dur)
+                            dragging = false
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = dur > 0,
+                        colors = androidx.compose.material3.SliderDefaults.colors(
+                            thumbColor = MaterialTheme.colorScheme.primary,
+                            activeTrackColor = Color.Transparent,
+                            inactiveTrackColor = Color.Transparent,
+                            activeTickColor = Color.Transparent,
+                            inactiveTickColor = Color.Transparent
+                        )
+                    )
+                }
+            }
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -644,57 +798,100 @@ fun NowPlayingScreen(vm: MainViewModel, onDismiss: () -> Unit) {
 
 // ==================== Library ====================
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LibraryScreen(vm: MainViewModel, onSettingsClick: () -> Unit) {
+fun LibraryScreen(vm: MainViewModel) {
     BackHandler(enabled = vm.libView != LibView.Artists) {
         vm.libBack()
     }
 
-    Column(Modifier.fillMaxSize()) {
-        TopAppBar(
-            title = {
-                Text(
-                    when (vm.libView) {
-                        LibView.Artists -> "Library"
-                        LibView.Albums -> vm.curArtist
-                        LibView.Tracks -> vm.curAlbum?.album ?: "Tracks"
-                    }
-                )
-            },
-            navigationIcon = {
-                if (vm.libView != LibView.Artists) {
-                    IconButton(onClick = { vm.libBack() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
-                    }
-                }
-            },
-            actions = {
-                if (vm.libView == LibView.Artists) {
-                    IconButton(onClick = { vm.randomAlbum() }) {
-                        Icon(Icons.Default.Shuffle, "Random album")
-                    }
-                    IconButton(onClick = onSettingsClick) {
-                        Icon(Icons.Default.Settings, "Settings")
-                    }
-                }
-            }
-        )
+    AnimatedContent(
+        targetState = vm.libView,
+        transitionSpec = {
+            val forward = targetState.ordinal > initialState.ordinal
+            (slideInHorizontally { if (forward) it else -it } + fadeIn()) togetherWith
+                    (slideOutHorizontally { if (forward) -it else it } + fadeOut())
+        },
+        label = "library"
+    ) { view ->
+        when (view) {
+            LibView.Artists -> ArtistList(vm)
+            LibView.Albums -> AlbumList(vm)
+            LibView.Tracks -> TrackList(vm)
+        }
+    }
+}
 
-        AnimatedContent(
-            targetState = vm.libView,
-            transitionSpec = {
-                val forward = targetState.ordinal > initialState.ordinal
-                (slideInHorizontally { if (forward) it else -it } + fadeIn()) togetherWith
-                        (slideOutHorizontally { if (forward) -it else it } + fadeOut())
+@Composable
+fun Scrollbar(
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    modifier: Modifier = Modifier
+) {
+    val info = listState.layoutInfo
+    val totalItems = info.totalItemsCount
+    if (totalItems == 0) return
+    val visibleCount = info.visibleItemsInfo.size
+    if (visibleCount >= totalItems) return
+
+    val scope = rememberCoroutineScope()
+    var dragging by remember { mutableStateOf(false) }
+
+    val thumbFraction = (visibleCount.toFloat() / totalItems).coerceIn(0.05f, 1f)
+    val scrollFraction = listState.firstVisibleItemIndex.toFloat() / (totalItems - visibleCount).coerceAtLeast(1)
+
+    val thumbColor = MaterialTheme.colorScheme.onSurface.copy(
+        alpha = if (dragging) 0.6f else if (listState.isScrollInProgress) 0.4f else 0.15f
+    )
+    val trackWidth = if (dragging) 8.dp else 4.dp
+
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .width(24.dp) // wide touch target
+            .padding(vertical = 4.dp)
+            .pointerInput(totalItems) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        dragging = true
+                        fun scrollTo(y: Float) {
+                            val fraction = (y / size.height).coerceIn(0f, 1f)
+                            val targetItem = (fraction * (totalItems - 1)).toInt()
+                            scope.launch { listState.scrollToItem(targetItem) }
+                        }
+                        scrollTo(down.position.y)
+                        down.consume()
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull() ?: break
+                            if (change.changedToUpIgnoreConsumed()) {
+                                dragging = false
+                                change.consume()
+                                break
+                            }
+                            scrollTo(change.position.y)
+                            change.consume()
+                        }
+                    }
+                }
             },
-            label = "library"
-        ) { view ->
-            when (view) {
-                LibView.Artists -> ArtistList(vm)
-                LibView.Albums -> AlbumList(vm)
-                LibView.Tracks -> TrackList(vm)
-            }
+        contentAlignment = Alignment.TopEnd
+    ) {
+        androidx.compose.foundation.Canvas(
+            modifier = Modifier
+                .fillMaxHeight()
+                .width(trackWidth)
+        ) {
+            val trackH = size.height
+            val thumbH = (trackH * thumbFraction).coerceAtLeast(24.dp.toPx())
+            val maxOffset = trackH - thumbH
+            val thumbY = scrollFraction * maxOffset
+
+            drawRoundRect(
+                color = thumbColor,
+                topLeft = androidx.compose.ui.geometry.Offset(0f, thumbY),
+                size = androidx.compose.ui.geometry.Size(size.width, thumbH),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width / 2f)
+            )
         }
     }
 }
@@ -707,28 +904,35 @@ fun ArtistList(vm: MainViewModel) {
         }
         return
     }
-    LazyColumn(Modifier.fillMaxSize()) {
-        item {
-            Text(
-                "${vm.artists.size} artists",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-            )
-        }
-        itemsIndexed(vm.artists) { _, artist ->
-            ListItem(
-                headlineContent = {
-                    Text(artist, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                },
-                modifier = Modifier.clickable { vm.loadAlbums(artist) },
-                trailingContent = {
-                    IconButton(onClick = { vm.showAction(MainViewModel.ActionTarget.ArtistTarget(artist)) }) {
-                        Icon(Icons.Default.MoreVert, "Actions")
+
+    val listState = rememberLazyListState()
+
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+            item {
+                Text(
+                    "${vm.artists.size} artists",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
+            }
+            itemsIndexed(vm.artists) { _, artist ->
+                ListItem(
+                    headlineContent = {
+                        Text(artist, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    },
+                    modifier = Modifier.clickable { vm.loadAlbums(artist) },
+                    trailingContent = {
+                        IconButton(onClick = { vm.showAction(MainViewModel.ActionTarget.ArtistTarget(artist)) }) {
+                            Icon(Icons.Default.MoreVert, "Actions")
+                        }
                     }
-                }
-            )
+                )
+            }
         }
+
+        Scrollbar(listState, Modifier.align(Alignment.CenterEnd))
     }
 }
 
@@ -746,6 +950,30 @@ fun AlbumList(vm: MainViewModel) {
         itemsIndexed(vm.albums) { _, album ->
             val isOffline = vm.downloadedAlbums.contains(album.id)
             ListItem(
+                leadingContent = {
+                    val albumCoverUrl = SubclerkApp.instance.api.coverUrl(album.id, 150)
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (albumCoverUrl != null) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(SubclerkApp.instance)
+                                    .data(albumCoverUrl)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = "Album art",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                            )
+                        } else {
+                            Icon(Icons.Default.MusicNote, null, modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                },
                 headlineContent = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(album.album, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
@@ -782,27 +1010,53 @@ fun TrackList(vm: MainViewModel) {
         // Album header
         if (vm.curAlbum != null) {
             item {
-                Column(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        vm.curArtist,
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    if (vm.curAlbum?.date?.isNotBlank() == true && vm.curAlbum?.date != "0000") {
+                    val headerCoverUrl = SubclerkApp.instance.api.coverUrl(vm.curAlbum!!.id, 300)
+                    Box(
+                        modifier = Modifier
+                            .size(80.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (headerCoverUrl != null) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(SubclerkApp.instance)
+                                    .data(headerCoverUrl)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = "Album art",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                            )
+                        } else {
+                            Icon(Icons.Default.MusicNote, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    Spacer(Modifier.width(16.dp))
+                    Column {
                         Text(
-                            vm.curAlbum!!.date,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            vm.curArtist,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (vm.curAlbum?.date?.isNotBlank() == true && vm.curAlbum?.date != "0000") {
+                            Text(
+                                vm.curAlbum!!.date,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "${vm.tracks.size} tracks",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                         )
                     }
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "${vm.tracks.size} tracks",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                    )
                 }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
             }
@@ -866,6 +1120,30 @@ fun SearchScreen(vm: MainViewModel) {
                 }
                 itemsIndexed(res.albums) { _, album ->
                     ListItem(
+                        leadingContent = {
+                            val searchAlbumCoverUrl = SubclerkApp.instance.api.coverUrl(album.id, 150)
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (searchAlbumCoverUrl != null) {
+                                    AsyncImage(
+                                        model = ImageRequest.Builder(SubclerkApp.instance)
+                                            .data(searchAlbumCoverUrl)
+                                            .crossfade(true)
+                                            .build(),
+                                        contentDescription = "Album art",
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                    )
+                                } else {
+                                    Icon(Icons.Default.MusicNote, null, modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        },
                         headlineContent = {
                             Text(album.album, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         },
@@ -925,68 +1203,115 @@ fun SearchScreen(vm: MainViewModel) {
 
 // ==================== Queue ====================
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun QueueScreen(vm: MainViewModel) {
-    Column(Modifier.fillMaxSize()) {
-        TopAppBar(
-            title = { Text("Queue") },
-            actions = {
-                if (vm.queue.isNotEmpty()) {
-                    IconButton(onClick = { vm.queueClear() }) {
-                        Icon(Icons.Default.DeleteSweep, "Clear queue")
-                    }
-                }
+fun QueueScreen(vm: MainViewModel, onSwitchToLibrary: () -> Unit = {}) {
+    if (vm.queue.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    Icons.AutoMirrored.Filled.QueueMusic,
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Queue is empty",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
-        )
+        }
+    } else {
+        var dragFromPos by remember { mutableStateOf(-1) }
+        var dragOffsetY by remember { mutableFloatStateOf(0f) }
+        var itemHeight by remember { mutableFloatStateOf(0f) }
 
-        if (vm.queue.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.QueueMusic,
-                        contentDescription = null,
-                        modifier = Modifier.size(48.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Text(
-                        "Queue is empty",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            // Disable list scrolling while dragging to prevent conflicts
+            userScrollEnabled = dragFromPos < 0
+        ) {
+            item {
+                Text(
+                    "${vm.queue.size} tracks",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
             }
-        } else {
-            LazyColumn(Modifier.fillMaxSize()) {
-                item {
-                    Text(
-                        "${vm.queue.size} tracks",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-                    )
-                }
-                itemsIndexed(vm.queue) { _, item ->
-                    val isCurrent = item.current
-                    ListItem(
-                        headlineContent = {
-                            Text(
-                                item.title.ifBlank { "Unknown" },
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
-                                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+            itemsIndexed(vm.queue) { _, item ->
+                val isCurrent = item.current
+                val isDragging = dragFromPos == item.position
+                val density = androidx.compose.ui.platform.LocalDensity.current
+
+                Surface(
+                    color = if (isDragging) MaterialTheme.colorScheme.surfaceContainerHigh
+                           else if (isCurrent) MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
+                           else MaterialTheme.colorScheme.surface,
+                    shadowElevation = if (isDragging) 8.dp else 0.dp,
+                    modifier = Modifier
+                        .then(if (isDragging) Modifier.zIndex(1f).offset(y = with(density) { dragOffsetY.toDp() }) else Modifier)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .combinedClickable(
+                                onClick = { vm.queuePlay(item.position) },
+                                onLongClick = { vm.showAction(MainViewModel.ActionTarget.QueueItemTarget(item)) }
                             )
-                        },
-                        supportingContent = {
-                            Text(
-                                "${item.artist} \u2014 ${item.album}",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        },
-                        leadingContent = {
+                            .onGloballyPositioned { if (itemHeight == 0f) itemHeight = it.size.height.toFloat() }
+                            .padding(start = 4.dp, end = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Drag handle
+                        Icon(
+                            Icons.Default.DragHandle,
+                            "Reorder",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                            modifier = Modifier
+                                .size(40.dp)
+                                .padding(8.dp)
+                                .pointerInput(Unit) {
+                                    awaitPointerEventScope {
+                                        while (true) {
+                                            val down = awaitFirstDown(requireUnconsumed = false)
+                                            dragFromPos = item.position
+                                            dragOffsetY = 0f
+                                            down.consume()
+
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                val change = event.changes.firstOrNull() ?: break
+                                                if (change.changedToUpIgnoreConsumed()) {
+                                                    dragFromPos = -1
+                                                    dragOffsetY = 0f
+                                                    change.consume()
+                                                    break
+                                                }
+                                                val dy = change.position.y - change.previousPosition.y
+                                                dragOffsetY += dy
+                                                change.consume()
+                                                if (itemHeight > 0f) {
+                                                    val steps = (dragOffsetY / itemHeight).toInt()
+                                                    if (steps != 0) {
+                                                        val newPos = (dragFromPos + steps).coerceIn(0, vm.queue.size - 1)
+                                                        if (newPos != dragFromPos) {
+                                                            vm.queueMove(dragFromPos, newPos)
+                                                            dragFromPos = newPos
+                                                            dragOffsetY -= steps * itemHeight
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                        )
+
+                        // Position / playing indicator
+                        Box(modifier = Modifier.width(28.dp), contentAlignment = Alignment.Center) {
                             if (isCurrent) {
                                 Icon(
                                     Icons.Default.PlayArrow,
@@ -999,76 +1324,317 @@ fun QueueScreen(vm: MainViewModel) {
                                     "${item.position + 1}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.width(24.dp),
-                                    textAlign = TextAlign.End
+                                    textAlign = TextAlign.Center
                                 )
                             }
-                        },
-                        trailingContent = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    fmtTime(item.duration),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                IconButton(
-                                    onClick = { vm.queueRemove(item.position) },
-                                    modifier = Modifier.size(32.dp)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Close,
-                                        "Remove",
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-                        },
-                        colors = if (isCurrent) ListItemDefaults.colors(
-                            containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
-                        ) else ListItemDefaults.colors(),
-                        modifier = Modifier.clickable { vm.queuePlay(item.position) }
+                        }
+
+                        // Track info
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 8.dp, vertical = 10.dp)
+                        ) {
+                            Text(
+                                item.title.ifBlank { "Unknown" },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                "${item.artist} \u2014 ${item.album}",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        Text(
+                            fmtTime(item.duration),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    // Queue item action sheet (triggered by long press)
+    if (vm.showActionMenu && vm.actionTarget is MainViewModel.ActionTarget.QueueItemTarget) {
+        val target = vm.actionTarget as MainViewModel.ActionTarget.QueueItemTarget
+        val item = target.item
+        val sheetState = rememberModalBottomSheetState()
+
+        ModalBottomSheet(
+            onDismissRequest = { vm.dismissAction() },
+            sheetState = sheetState,
+            containerColor = MaterialTheme.colorScheme.surface
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 32.dp)
+            ) {
+                Text(
+                    item.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
+                )
+                Text(
+                    "${item.artist} \u2014 ${item.album}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 24.dp)
+                )
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+
+                ListItem(
+                    headlineContent = { Text("Go to artist") },
+                    leadingContent = { Icon(Icons.Default.Person, null) },
+                    modifier = Modifier.clickable {
+                        vm.goToArtistFromQueue(item)
+                        vm.dismissAction()
+                        onSwitchToLibrary()
+                    }
+                )
+                if (item.albumId.isNotBlank()) {
+                    ListItem(
+                        headlineContent = { Text("Go to album") },
+                        leadingContent = { Icon(Icons.Default.Album, null) },
+                        modifier = Modifier.clickable {
+                            vm.loadTracks(Album(item.albumId, item.artist, item.album, ""))
+                            vm.dismissAction()
+                            onSwitchToLibrary()
+                        }
                     )
                 }
+                if (item.songId.isNotBlank()) {
+                    ListItem(
+                        headlineContent = { Text("Add to playlist") },
+                        leadingContent = { Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null) },
+                        modifier = Modifier.clickable {
+                            vm.dismissAction()
+                            vm.showAddToPlaylist(item.songId)
+                        }
+                    )
+                }
+                ListItem(
+                    headlineContent = { Text("Remove from queue") },
+                    leadingContent = { Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error) },
+                    modifier = Modifier.clickable {
+                        vm.queueRemove(item.position)
+                        vm.dismissAction()
+                    }
+                )
             }
         }
     }
 }
 
-// ==================== Devices ====================
+// ==================== Playlists ====================
+
+@Composable
+fun PlaylistsScreen(vm: MainViewModel) {
+    BackHandler(enabled = vm.playlistView) {
+        vm.playlistBack()
+    }
+
+    AnimatedContent(
+        targetState = vm.playlistView,
+        transitionSpec = {
+            if (targetState) {
+                (slideInHorizontally { it } + fadeIn()) togetherWith (slideOutHorizontally { -it } + fadeOut())
+            } else {
+                (slideInHorizontally { -it } + fadeIn()) togetherWith (slideOutHorizontally { it } + fadeOut())
+            }
+        },
+        label = "playlists"
+    ) { showTracks ->
+        if (showTracks) {
+            PlaylistTrackList(vm)
+        } else {
+            PlaylistList(vm)
+        }
+    }
+}
+
+@Composable
+fun PlaylistList(vm: MainViewModel) {
+    if (vm.playlists.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    Icons.AutoMirrored.Filled.PlaylistPlay,
+                    contentDescription = null,
+                    modifier = Modifier.size(48.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "No playlists",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    } else {
+        LazyColumn(Modifier.fillMaxSize()) {
+            item {
+                Text(
+                    "${vm.playlists.size} playlists",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
+            }
+            itemsIndexed(vm.playlists) { _, playlist ->
+                ListItem(
+                    headlineContent = {
+                        Text(playlist.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    },
+                    supportingContent = {
+                        val parts = mutableListOf<String>()
+                        parts.add("${playlist.songCount} tracks")
+                        if (playlist.duration > 0) {
+                            val mins = playlist.duration / 60
+                            if (mins >= 60) {
+                                parts.add("${mins / 60}h ${mins % 60}m")
+                            } else {
+                                parts.add("${mins}m")
+                            }
+                        }
+                        Text(parts.joinToString(" \u2022 "))
+                    },
+                    leadingContent = {
+                        val coverUrl = if (playlist.coverArt.isNotBlank())
+                            SubclerkApp.instance.api.coverUrl(playlist.coverArt, 150)
+                        else null
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (coverUrl != null) {
+                                AsyncImage(
+                                    model = ImageRequest.Builder(SubclerkApp.instance)
+                                        .data(coverUrl)
+                                        .crossfade(true)
+                                        .build(),
+                                    contentDescription = "Playlist art",
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                )
+                            } else {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.PlaylistPlay, null,
+                                    modifier = Modifier.size(24.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    },
+                    modifier = Modifier.clickable { vm.loadPlaylistTracks(playlist) },
+                    trailingContent = {
+                        IconButton(onClick = { vm.showAction(MainViewModel.ActionTarget.PlaylistTarget(playlist)) }) {
+                            Icon(Icons.Default.MoreVert, "Actions")
+                        }
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun PlaylistTrackList(vm: MainViewModel) {
+    LazyColumn(Modifier.fillMaxSize()) {
+        item {
+            Text(
+                "${vm.playlistTracks.size} tracks",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+        }
+        itemsIndexed(vm.playlistTracks) { idx, track ->
+            ListItem(
+                leadingContent = {
+                    Text(
+                        "${idx + 1}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.width(28.dp),
+                        textAlign = TextAlign.End
+                    )
+                },
+                headlineContent = {
+                    Text(track.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
+                supportingContent = {
+                    Text(
+                        "${track.artist} \u2014 ${track.album}",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                modifier = Modifier.clickable { vm.showAction(MainViewModel.ActionTarget.TrackTarget(track)) }
+            )
+        }
+    }
+}
+
+// ==================== Devices Sheet ====================
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DevicesScreen(vm: MainViewModel) {
-    Column(Modifier.fillMaxSize()) {
-        TopAppBar(
-            title = { Text("Devices") },
-            actions = {
-                IconButton(onClick = { vm.loadDevices() }) {
-                    Icon(Icons.Default.Refresh, "Refresh")
-                }
-            }
-        )
+fun DevicesSheet(vm: MainViewModel, onDismiss: () -> Unit) {
+    val sheetState = rememberModalBottomSheetState()
 
-        if (vm.devices.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.Default.Devices,
-                        contentDescription = null,
-                        modifier = Modifier.size(48.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                    )
-                    Spacer(Modifier.height(12.dp))
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 32.dp)
+        ) {
+            Text(
+                "Devices",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+
+            if (vm.devices.isEmpty()) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(48.dp),
+                    contentAlignment = Alignment.Center
+                ) {
                     Text(
                         "No devices found",
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-            }
-        } else {
-            LazyColumn(Modifier.fillMaxSize()) {
-                itemsIndexed(vm.devices) { _, dev ->
+            } else {
+                vm.devices.forEach { dev ->
                     ListItem(
                         headlineContent = {
                             Text(
@@ -1081,7 +1647,7 @@ fun DevicesScreen(vm: MainViewModel) {
                             val parts = mutableListOf<String>()
                             parts.add(when (dev.type) {
                                 "local" -> "Server"
-                                "browser" -> "Stream"
+                                "browser" -> "Mobile"
                                 "agent" -> "Agent"
                                 else -> dev.type
                             })
@@ -1111,8 +1677,74 @@ fun DevicesScreen(vm: MainViewModel) {
                                 )
                             }
                         },
-                        modifier = Modifier.clickable { vm.setActiveDevice(dev.id) }
+                        modifier = Modifier.clickable {
+                            vm.setActiveDevice(dev.id)
+                            onDismiss()
+                        }
                     )
+                }
+            }
+        }
+    }
+}
+
+// ==================== Playlist Picker ====================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun PlaylistPickerSheet(vm: MainViewModel) {
+    val sheetState = rememberModalBottomSheetState()
+
+    ModalBottomSheet(
+        onDismissRequest = { vm.dismissPlaylistPicker() },
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 32.dp)
+        ) {
+            Text(
+                "Add to playlist",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+
+            if (vm.playlists.isEmpty()) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(48.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "No playlists found",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
+                LazyColumn {
+                    itemsIndexed(vm.playlists) { _, playlist ->
+                        ListItem(
+                            headlineContent = {
+                                Text(playlist.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            },
+                            supportingContent = {
+                                Text("${playlist.songCount} tracks")
+                            },
+                            leadingContent = {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.PlaylistPlay, null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            },
+                            modifier = Modifier.clickable { vm.addToPlaylist(playlist.id) }
+                        )
+                    }
                 }
             }
         }
@@ -1142,9 +1774,13 @@ fun SettingsScreen(onDismiss: () -> Unit) {
     var format by remember { mutableStateOf(prefs.getString("audio_format", "") ?: "") }
     var bitrate by remember { mutableIntStateOf(prefs.getInt("audio_bitrate", 0)) }
     var replaygain by remember { mutableStateOf(prefs.getString("replaygain", "off") ?: "off") }
+    var deviceSecret by remember { mutableStateOf(prefs.getString("device_secret", "") ?: "") }
 
-    fun saveAndReRegister() {
-        android.util.Log.d("Settings", "Saving: ssid='$homeWifiSsid' external='$externalServer'")
+    // Dialog state
+    var editingField by remember { mutableStateOf<String?>(null) }
+    var editValue by remember { mutableStateOf("") }
+
+    fun saveAll() {
         prefs.edit()
             .putString("server", server)
             .putString("external_server", externalServer)
@@ -1154,8 +1790,84 @@ fun SettingsScreen(onDismiss: () -> Unit) {
             .putString("audio_format", format)
             .putInt("audio_bitrate", bitrate)
             .putString("replaygain", replaygain)
+            .putString("device_secret", deviceSecret)
             .apply()
         SubclerkApp.instance.applyServerForCurrentNetwork()
+    }
+
+    // Edit dialog
+    if (editingField != null) {
+        val fieldLabel = when (editingField) {
+            "server" -> "Local server address"
+            "external_server" -> "External server address"
+            "navidrome_url" -> "External Navidrome URL"
+            "home_wifi_ssid" -> "Home WiFi SSID"
+            "device_name" -> "Device name"
+            "device_secret" -> "Device secret"
+            else -> ""
+        }
+        AlertDialog(
+            onDismissRequest = { editingField = null },
+            title = { Text(fieldLabel) },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = editValue,
+                        onValueChange = { editValue = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = {
+                            Text(when (editingField) {
+                                "server" -> "192.168.1.10:6701"
+                                "external_server" -> "subclerk.example.com:6701"
+                                "navidrome_url" -> "https://music.example.com"
+                                "home_wifi_ssid" -> "MyHomeNetwork"
+                                else -> ""
+                            })
+                        }
+                    )
+                    // Show current WiFi hint for SSID field
+                    if (editingField == "home_wifi_ssid") {
+                        val currentSsid = remember { SubclerkApp.instance.getCurrentSSID() }
+                        if (currentSsid != null) {
+                            Spacer(Modifier.height(8.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    "Current: $currentSsid",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = { editValue = currentSsid }) {
+                                    Text("Use current")
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    when (editingField) {
+                        "server" -> server = editValue
+                        "external_server" -> externalServer = editValue
+                        "navidrome_url" -> navidromeUrl = editValue
+                        "home_wifi_ssid" -> homeWifiSsid = editValue
+                        "device_name" -> deviceName = editValue
+                        "device_secret" -> deviceSecret = editValue
+                    }
+                    editingField = null
+                    saveAll()
+                }) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingField = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     Surface(
@@ -1167,205 +1879,190 @@ fun SettingsScreen(onDismiss: () -> Unit) {
                 title = { Text("Settings") },
                 navigationIcon = {
                     IconButton(onClick = {
-                        saveAndReRegister()
+                        saveAll()
                         onDismiss()
                     }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                     }
-                }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface
+                )
             )
 
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                // Connection
+            LazyColumn(Modifier.fillMaxSize()) {
+                // --- Connection section ---
                 item {
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(
-                                "Connection",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            OutlinedTextField(
-                                value = server,
-                                onValueChange = { server = it },
-                                label = { Text("Local server address") },
-                                placeholder = { Text("192.168.1.10:6701") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = OutlinedTextFieldDefaults.colors()
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            OutlinedTextField(
-                                value = externalServer,
-                                onValueChange = { externalServer = it },
-                                label = { Text("External server address") },
-                                placeholder = { Text("subclerk.example.com:6701") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                                supportingText = {
-                                    Text("Used when not on home WiFi")
-                                },
-                                colors = OutlinedTextFieldDefaults.colors()
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            OutlinedTextField(
-                                value = navidromeUrl,
-                                onValueChange = { navidromeUrl = it },
-                                label = { Text("External Navidrome URL") },
-                                placeholder = { Text("https://music.example.com") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                                supportingText = {
-                                    Text("Navidrome URL for streaming on external network")
-                                },
-                                colors = OutlinedTextFieldDefaults.colors()
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            val currentSsid = remember { SubclerkApp.instance.getCurrentSSID() }
-                            OutlinedTextField(
-                                value = homeWifiSsid,
-                                onValueChange = { homeWifiSsid = it },
-                                label = { Text("Home WiFi SSID") },
-                                placeholder = { Text(currentSsid ?: "MyHomeNetwork") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                                trailingIcon = {
-                                    if (currentSsid != null && currentSsid != homeWifiSsid) {
-                                        IconButton(onClick = { homeWifiSsid = currentSsid }) {
-                                            Icon(Icons.Default.Refresh, "Use current WiFi")
-                                        }
-                                    }
-                                },
-                                supportingText = {
-                                    Text(if (currentSsid != null) "Current: $currentSsid" else "Not on WiFi")
-                                },
-                                colors = OutlinedTextFieldDefaults.colors()
-                            )
+                    SettingsSectionHeader("Connection")
+                }
+                item {
+                    SettingsTextItem(
+                        title = "Local server address",
+                        value = server.ifBlank { "Not set" },
+                        onClick = {
+                            editValue = server
+                            editingField = "server"
                         }
-                    }
+                    )
+                }
+                item {
+                    SettingsTextItem(
+                        title = "External server address",
+                        value = externalServer.ifBlank { "Not set" },
+                        subtitle = "Used when not on home WiFi",
+                        onClick = {
+                            editValue = externalServer
+                            editingField = "external_server"
+                        }
+                    )
+                }
+                item {
+                    SettingsTextItem(
+                        title = "External Navidrome URL",
+                        value = navidromeUrl.ifBlank { "Not set" },
+                        subtitle = "For streaming on external network",
+                        onClick = {
+                            editValue = navidromeUrl
+                            editingField = "navidrome_url"
+                        }
+                    )
+                }
+                item {
+                    val currentSsid = remember { SubclerkApp.instance.getCurrentSSID() }
+                    SettingsTextItem(
+                        title = "Home WiFi SSID",
+                        value = homeWifiSsid.ifBlank { "Not set" },
+                        subtitle = if (currentSsid != null) "Current: $currentSsid" else "Not on WiFi",
+                        onClick = {
+                            editValue = homeWifiSsid
+                            editingField = "home_wifi_ssid"
+                        }
+                    )
                 }
 
-                // Device
+                // --- Device section ---
                 item {
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(
-                                "Device",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            OutlinedTextField(
-                                value = deviceName,
-                                onValueChange = { deviceName = it },
-                                label = { Text("Device name") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = OutlinedTextFieldDefaults.colors()
-                            )
+                    SettingsSectionHeader("Device")
+                }
+                item {
+                    SettingsTextItem(
+                        title = "Device name",
+                        value = deviceName,
+                        onClick = {
+                            editValue = deviceName
+                            editingField = "device_name"
                         }
-                    }
+                    )
+                }
+                item {
+                    SettingsTextItem(
+                        title = "Device secret",
+                        value = if (deviceSecret.isBlank()) "Not set" else "\u2022".repeat(deviceSecret.length.coerceAtMost(16)),
+                        subtitle = "Shared secret for authenticated communication",
+                        onClick = {
+                            editValue = deviceSecret
+                            editingField = "device_secret"
+                        }
+                    )
                 }
 
-                // Audio quality
+                // --- Audio section ---
                 item {
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(
-                                "Audio Quality",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            Text(
-                                "Format",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf(
-                                    "" to "Original",
-                                    "opus" to "Opus",
-                                    "mp3" to "MP3",
-                                    "aac" to "AAC",
-                                    "flac" to "FLAC"
-                                ).forEach { (value, label) ->
-                                    FilterChip(
-                                        selected = format == value,
-                                        onClick = { format = value },
-                                        label = { Text(label) }
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(12.dp))
-                            Text(
-                                "Bitrate",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf(
-                                    0 to "Max",
-                                    64 to "64k",
-                                    128 to "128k",
-                                    192 to "192k",
-                                    256 to "256k",
-                                    320 to "320k"
-                                ).forEach { (value, label) ->
-                                    FilterChip(
-                                        selected = bitrate == value,
-                                        onClick = { bitrate = value },
-                                        label = { Text(label) }
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(12.dp))
-                            Text(
-                                "ReplayGain",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf(
-                                    "off" to "Off",
-                                    "track" to "Track",
-                                    "album" to "Album"
-                                ).forEach { (value, label) ->
-                                    FilterChip(
-                                        selected = replaygain == value,
-                                        onClick = { replaygain = value },
-                                        label = { Text(label) }
-                                    )
-                                }
-                            }
-                        }
-                    }
+                    SettingsSectionHeader("Audio")
+                }
+                item {
+                    SettingsChipRow(
+                        title = "Format",
+                        options = listOf("" to "Original", "opus" to "Opus", "mp3" to "MP3", "aac" to "AAC", "flac" to "FLAC"),
+                        selected = format,
+                        onSelect = { format = it; saveAll() }
+                    )
+                }
+                item {
+                    SettingsChipRow(
+                        title = "Bitrate",
+                        options = listOf(0 to "Max", 64 to "64k", 128 to "128k", 192 to "192k", 256 to "256k", 320 to "320k"),
+                        selected = bitrate,
+                        onSelect = { bitrate = it; saveAll() }
+                    )
+                }
+                item {
+                    SettingsChipRow(
+                        title = "ReplayGain",
+                        options = listOf("off" to "Off", "track" to "Track", "album" to "Album"),
+                        selected = replaygain,
+                        onSelect = { replaygain = it; saveAll() }
+                    )
                 }
 
                 // Bottom spacing
                 item { Spacer(Modifier.height(32.dp)) }
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingsSectionHeader(title: String) {
+    Text(
+        title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 8.dp)
+    )
+}
+
+@Composable
+fun SettingsTextItem(
+    title: String,
+    value: String,
+    subtitle: String? = null,
+    onClick: () -> Unit
+) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = {
+            Column {
+                Text(
+                    value,
+                    color = if (value == "Not set") MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (subtitle != null) {
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                    )
+                }
+            }
+        },
+        modifier = Modifier.clickable(onClick = onClick)
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun <T> SettingsChipRow(
+    title: String,
+    options: List<Pair<T, String>>,
+    selected: T,
+    onSelect: (T) -> Unit
+) {
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Text(
+            title,
+            style = MaterialTheme.typography.bodyLarge
+        )
+        Spacer(Modifier.height(8.dp))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            options.forEach { (value, label) ->
+                FilterChip(
+                    selected = selected == value,
+                    onClick = { onSelect(value) },
+                    label = { Text(label) }
+                )
             }
         }
     }
@@ -1384,9 +2081,12 @@ fun ActionSheet(vm: MainViewModel) {
         is MainViewModel.ActionTarget.TrackTarget -> target.track.title
         is MainViewModel.ActionTarget.SearchAlbumTarget -> target.album.album
         is MainViewModel.ActionTarget.SearchTrackTarget -> target.track.title
+        is MainViewModel.ActionTarget.QueueItemTarget -> target.item.title
+        is MainViewModel.ActionTarget.PlaylistTarget -> target.playlist.name
     }
     val canBrowse = target !is MainViewModel.ActionTarget.TrackTarget &&
-            target !is MainViewModel.ActionTarget.SearchTrackTarget
+            target !is MainViewModel.ActionTarget.SearchTrackTarget &&
+            target !is MainViewModel.ActionTarget.PlaylistTarget
 
     ModalBottomSheet(
         onDismissRequest = { vm.dismissAction() },
@@ -1430,6 +2130,23 @@ fun ActionSheet(vm: MainViewModel) {
                     headlineContent = { Text("Browse into") },
                     leadingContent = { Icon(Icons.Default.FolderOpen, null) },
                     modifier = Modifier.clickable { vm.browseIntoAction() }
+                )
+            }
+
+            // Add to playlist option for tracks
+            val songIdForPlaylist = when (target) {
+                is MainViewModel.ActionTarget.TrackTarget -> target.track.songId
+                is MainViewModel.ActionTarget.SearchTrackTarget -> target.track.songId
+                else -> null
+            }
+            if (songIdForPlaylist != null) {
+                ListItem(
+                    headlineContent = { Text("Add to playlist") },
+                    leadingContent = { Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null) },
+                    modifier = Modifier.clickable {
+                        vm.dismissAction()
+                        vm.showAddToPlaylist(songIdForPlaylist)
+                    }
                 )
             }
 
